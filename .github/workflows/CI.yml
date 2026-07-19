@@ -1,0 +1,61 @@
+name: CI
+on:
+  push:
+    branches: [main]
+    tags: ['*']
+  pull_request:
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+jobs:
+  test:
+    name: Julia ${{ matrix.version }} - ${{ matrix.mode }}
+    runs-on: ubuntu-latest
+    continue-on-error: ${{ matrix.version == 'nightly' }}
+    strategy:
+      fail-fast: false
+      matrix:
+        version: ['1.10', '1', 'nightly']   # LTS, latest stable, nightly
+        mode: [with-lv, without-lv]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: julia-actions/setup-julia@v2
+        with:
+          version: ${{ matrix.version }}
+      - uses: julia-actions/cache@v2
+      - name: Strip LoopVectorization from the test target
+        if: matrix.mode == 'without-lv'
+        # exercise the weakdep-absent path (the extension never loads)
+        run: |
+          julia -e '
+            using TOML
+            t = TOML.parsefile("Project.toml")
+            delete!(t["extras"], "LoopVectorization")
+            t["targets"]["test"] = filter(!=("LoopVectorization"), t["targets"]["test"])
+            open("Project.toml", "w") do io
+                TOML.print(io, t)
+            end'
+        shell: bash
+      - uses: julia-actions/julia-buildpkg@v1
+      - uses: julia-actions/julia-runtest@v1
+      - uses: julia-actions/julia-processcoverage@v1
+        if: matrix.version == '1' && matrix.mode == 'with-lv'
+      - uses: codecov/codecov-action@v5
+        if: matrix.version == '1' && matrix.mode == 'with-lv'
+        with:
+          files: lcov.info
+          token: ${{ secrets.CODECOV_TOKEN }}
+          fail_ci_if_error: false
+  example:
+    name: Example smoke test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: julia-actions/setup-julia@v2
+        with:
+          version: '1'
+      - uses: julia-actions/cache@v2
+      - uses: julia-actions/julia-buildpkg@v1
+      # example 01 uses only PolyStep + stdlib, so it runs on the package project
+      # without instantiating the heavy examples environment; it self-asserts a gate
+      - run: julia --project=. examples/01_hard_decision_tree.jl

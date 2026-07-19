@@ -1,0 +1,45 @@
+name = "PolyStep"
+uuid = "1d716556-7f39-4cf5-924f-ba9c6bc0b019"
+version = "0.1.0"
+authors = ["An T. Le <an.thai.le97@gmail.com> and contributors"]
+
+[deps]
+LinearAlgebra = "37e2e46d-f89d-539d-b4ee-838fcccc9c8e"
+Polyester = "f517fe37-dbe3-4b94-8317-1923a5111588"
+Random = "9a3f8284-a2c9-5f02-9a11-845980a1fd5c"
+SLEEFPirates = "476501e8-09a2-5ece-8869-fb82de89a1fa"
+StaticArrays = "90137ffa-7385-5640-81b9-e52037218182"
+Statistics = "10745b16-79ce-11e8-11f9-7d13ad32a3b2"
+
+[weakdeps]
+CUDA = "052768ef-5323-5732-b1bb-66c8b64840ba"
+LoopVectorization = "bdcacae8-1622-11e9-2a5c-532679323890"
+OptimizationBase = "bca83a33-5cc9-4baa-983d-23429ab6bcbb"
+
+[extensions]
+PolyStepCUDAExt = "CUDA"
+PolyStepLoopVectorizationExt = "LoopVectorization"
+PolyStepOptimizationExt = "OptimizationBase"
+
+[compat]
+Aqua = "0.8.16"
+CUDA = "5, 6"
+Test = "1"
+LinearAlgebra = "1.10"
+LoopVectorization = "0.12"
+OptimizationBase = "5"
+Polyester = "0.7.19"
+Random = "1.10"
+SLEEFPirates = "0.6.46"
+StaticArrays = "1.9.18"
+Statistics = "1.10"
+julia = "1.10"
+
+[extras]
+Aqua = "4c88cf16-eb10-579e-8560-4a9242c79595"
+LoopVectorization = "bdcacae8-1622-11e9-2a5c-532679323890"
+OptimizationBase = "bca83a33-5cc9-4baa-983d-23429ab6bcbb"
+Test = "8dfed614-e22c-5e08-85e1-65c5234f0b40"
+
+[targets]
+test = ["Aqua", "LoopVectorization", "OptimizationBase", "Test"]
