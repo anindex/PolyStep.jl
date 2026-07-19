@@ -52,8 +52,12 @@ using PolyStep: softmax_cols!, lse_cols!, lse_rows!, sanitize_cost!, scale_cost!
     end
     absC = abs.(C)
     @test @allocated(softmax_cols!(W, C, 0.3)) == 0
-    @test @allocated(lse_cols!(out_p, C, addv)) == 0
-    @test @allocated(lse_rows!(out_v, C, addp, accm, accs)) == 0
+    # lse_cols!/lse_rows! dispatch to @turbo kernels when LoopVectorization is loaded;
+    # LV on Julia 1.10 boxes an intermediate (~1.8 kB), eliminated on 1.11+ and on the
+    # base no-LV path. Bound on 1.10, ban elsewhere.
+    lse_bound = VERSION < v"1.11" ? 2048 : 0
+    @test @allocated(lse_cols!(out_p, C, addv)) <= lse_bound
+    @test @allocated(lse_rows!(out_v, C, addp, accm, accs)) <= lse_bound
     @test @allocated(sanitize_cost!(C)) == 0
     @test @allocated(scale_cost!(Cm, C, :mean)) == 0
     @test @allocated(normalize_particle_masses!(W, absC)) == 0
