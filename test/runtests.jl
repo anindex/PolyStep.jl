@@ -11,6 +11,7 @@ using Statistics
     include("test_core.jl")
     include("test_ask_tell.jl")
     include("test_edge_cases.jl")
+    include("test_subspace.jl")
     # optional-dependency suites: run only when the package resolves in the
     # test env (the CI without-lv lane strips LoopVectorization)
     Base.find_package("LoopVectorization") === nothing || include("test_lv.jl")

@@ -16,6 +16,7 @@ include("dynamics.jl")
 include("quadratic.jl")
 include("core.jl")
 include("es.jl")
+include("subspace.jl")
 
 export orthoplex_vertices, simplex_vertices, cube_vertices, polytope_vertices, num_vertices
 export haar_rotations!, biased_rotation!, probe_scales
@@ -25,6 +26,9 @@ export SoftmaxSolver, TemperedSoftmaxSolver, KLSoftmaxSolver, SinkhornSolver,
        MinCostGreedySolver, TopKMeanSolver, OTResult
 export PolyStepConfig, PolyStepState, init_state, step!, solve!, columnwise
 export PolyStepES, ask!, tell!, minimize, popsize, PolyStepOptimizer
+export ParamEntry, ParamLayout, LayerSpec, HybridSubspace
+export subspace_dim, compression_ratio, expand, expand!, project, project!,
+       reconstruct_batch, subspace_objective
 # `solve` is not exported (avoids the CommonSolve/SciML name clash). Call
 # PolyStep.solve or use step!/ask!/tell!.
 
