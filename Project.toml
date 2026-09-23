@@ -1,6 +1,6 @@
 name = "PolyStep"
 uuid = "1d716556-7f39-4cf5-924f-ba9c6bc0b019"
-version = "0.1.0"
+version = "0.2.0"
 authors = ["An T. Le <an.thai.le97@gmail.com> and contributors"]
 
 [deps]

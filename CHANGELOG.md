@@ -1,5 +1,15 @@
 # Changelog
 
+## v0.2.0
+
+- `ParamLayout` and `HybridSubspace`: a fixed per-layer orthonormal basis for
+  parameter vectors of layered models, with per-layer rank, a total-dimension
+  budget (`max_subspace_dim`), `project`/`expand` between the full vector and the
+  subspace coordinates, and `subspace_objective` to run any PolyStep solver in the
+  subspace. The dimension arithmetic and the cap semantics mirror the Python
+  `HybridSubspace`; the package tests assert them against the Python reference
+  for four layouts, five ranks and five caps.
+
 ## v0.1.0
 
 Initial release.
