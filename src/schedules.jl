@@ -1,6 +1,5 @@
-# Epsilon schedules (port of epsilon.py). All consume the 0-based iteration
-# count (incremented at the end of each step); `nothing` means "not started"
-# and returns `init`.
+# Epsilon schedules (port of epsilon.py). All take the 0-based iteration count;
+# `nothing` means not started and returns `init`.
 
 """
     LinearEpsilon(; target=1e-3, init=1.0, decay=0.01)
@@ -23,8 +22,9 @@ end
     CosineEpsilon(; target=1e-3, init=1.0, decay=0.01, total_steps=0, restart_mult=1.0)
 
 `eps(t) = target + 0.5*(init-target)*(1 + cos(pi*t/T))` with
-`T = total_steps > 0 ? total_steps : max(1, floor((init-target)/decay))`,
-plus optional SGDR warm restarts (`restart_mult > 1`).
+`T = total_steps > 0 ? total_steps : max(1, ceil((init-target)/decay))` (so the
+target lands where `LinearEpsilon`'s does), plus optional SGDR warm restarts
+(`restart_mult > 1`); each restart period grows by at least one step.
 """
 Base.@kwdef struct CosineEpsilon
     target::Float64 = 1e-3
@@ -86,11 +86,15 @@ const EpsilonSchedule = Union{LinearEpsilon, CosineEpsilon, ProgressiveEpsilon}
 is_scheduled(::Real) = false
 is_scheduled(::EpsilonSchedule) = true
 
+"""
+    epsilon_at(schedule, t)
+
+Value of a constant or a schedule at step `t` (0-based); `t = nothing` gives the
+initial value.
+"""
 epsilon_at(x::Real, _) = Float64(x)
 epsilon_at(s::LinearEpsilon, ::Nothing) = s.init
 epsilon_at(s::LinearEpsilon, t::Integer) = max(s.init - s.decay * t, s.target)
-# total_steps=0: iteration ignored, return the EMA-smoothed value. total_steps>0:
-# decreasing cosine baseline modulated by the bounded feedback factor smoothed/init.
 epsilon_at(s::ProgressiveEpsilon, ::Nothing) = s.total_steps > 0 ? _prog_setpoint(s, 0) : s.smoothed
 epsilon_at(s::ProgressiveEpsilon, t::Integer) = s.total_steps > 0 ? _prog_setpoint(s, t) : s.smoothed
 function _prog_setpoint(s::ProgressiveEpsilon, t::Integer)
@@ -100,25 +104,24 @@ function _prog_setpoint(s::ProgressiveEpsilon, t::Integer)
 end
 epsilon_at(s::CosineEpsilon, ::Nothing) = s.init
 function epsilon_at(s::CosineEpsilon, t::Integer)
+    # clamped in Float64 first, so a zero decay or a huge init can't overflow Int
     T = s.total_steps > 0 ? s.total_steps :
-        max(1, Int(floor((s.init - s.target) / max(s.decay, 1e-12))))
+        ceil(Int, clamp((s.init - s.target) / max(s.decay, 1e-12), 1.0, 2.0^62))
     if s.restart_mult > 1.0
         period = T
         tt = Int(t)
-        restarts = 0
-        # bounded so restart_mult ~ 1 or a tiny period can't loop forever
-        while tt >= period && period > 0 && restarts < 100
+        # the period grows by >= 1 per restart, so the walk always terminates
+        while tt >= period
             tt -= period
-            period = Int(floor(period * s.restart_mult))
-            restarts += 1
+            period = max(period + 1, floor(Int, min(period * s.restart_mult, 2.0^62)))
         end
-        T_local = max(period, 1)
+        T_local = period
         t_local = tt
     else
         T_local = T
         t_local = min(Int(t), T)
     end
-    # clamp keeps cos inside [0, pi] even when the restart loop maxes out
+    # clamp keeps cos inside [0, pi] for a negative t
     t_local = clamp(t_local, 0, T_local)
     return s.target + 0.5 * (s.init - s.target) * (1.0 + cos(pi * t_local / max(T_local, 1)))
 end

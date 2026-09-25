@@ -35,13 +35,10 @@ const PY_MIXED_COORDS_R8_CAP256 = [63, 128, 55, 10]
         @test [e.offset for e in l.entries] == [0, 12]
         @test [e.numel for e in l.entries] == [12, 5]
         @test [e.key for e in l.entries] == ["a", "b"]
-        @test l.padded_size == 18
         @test length(l) == 2
         la = ParamLayout([zeros(3, 4), zeros(5)])
         @test [e.shape for e in la.entries] == [(3, 4), (5,)]
         @test [e.key for e in la.entries] == ["p1", "p2"]
-        @test ParamLayout(["a" => (2, 2)]; particle_dim = 8).padded_size == 8
-        @test_throws ArgumentError ParamLayout(["a" => (2, 2)]; particle_dim = 0)
     end
 
     @testset "dimension arithmetic against python from_layout" begin
@@ -70,7 +67,11 @@ const PY_MIXED_COORDS_R8_CAP256 = [63, 128, 55, 10]
               PY_MIXED_COORDS_R4_CAP512
         @test [sp.ncoords for sp in HybridSubspace(mixed; rank = 8, max_subspace_dim = 256).specs] ==
               PY_MIXED_COORDS_R8_CAP256
-        @test compression_ratio(s1) ≈ 512 / 25857
+        @test isapprox(compression_ratio(s1), 512 / 25857)
+        # column-major N-D: d_out is the last axis, as torch (32, 16, 3, 3)
+        conv = HybridSubspace(ParamLayout(["c" => (3, 3, 16, 32)]); rank = 4)
+        @test conv.specs[1].ncoords == 704
+        @test conv.specs[1].projected
     end
 
     @testset "unprojected parameters" begin
@@ -79,7 +80,7 @@ const PY_MIXED_COORDS_R8_CAP256 = [63, 128, 55, 10]
         @test all(!sp.projected for sp in s.specs)
         @test subspace_dim(s) == s.total_params
         z = randn(Xoshiro(3), subspace_dim(s))
-        @test expand(s, z) ≈ z
+        @test isapprox(expand(s, z), z)
         bias = ParamLayout([("p$(i)" => sh) for (i, sh) in enumerate(BIAS_ONLY_SHAPES)])
         sb = HybridSubspace(bias; rank = 8)
         @test all(!sp.projected for sp in sb.specs)
@@ -92,7 +93,7 @@ const PY_MIXED_COORDS_R8_CAP256 = [63, 128, 55, 10]
         for (P, sp) in zip(s.projections, s.specs)
             sp.projected || continue
             @test size(P) == (sp.numel, sp.ncoords)
-            @test transpose(P) * P ≈ I(sp.ncoords) atol = 1e-10
+            @test isapprox(transpose(P) * P, I(sp.ncoords); atol = 1e-10)
         end
     end
 
@@ -102,12 +103,12 @@ const PY_MIXED_COORDS_R8_CAP256 = [63, 128, 55, 10]
         z = randn(Xoshiro(5), subspace_dim(s))
         x = expand(s, z)
         @test length(x) == s.total_params
-        @test project(s, x) ≈ z atol = 1e-10
-        @test expand(s, project(s, x)) ≈ x atol = 1e-10
+        @test isapprox(project(s, x), z; atol = 1e-10)
+        @test isapprox(expand(s, project(s, x)), x; atol = 1e-10)
         zz = similar(z)
-        @test project!(zz, s, x) ≈ z atol = 1e-10
+        @test isapprox(project!(zz, s, x), z; atol = 1e-10)
         xx = similar(x)
-        @test expand!(xx, s, z) ≈ x
+        @test isapprox(expand!(xx, s, z), x)
         @test_throws DimensionMismatch expand(s, zeros(subspace_dim(s) + 1))
         @test_throws DimensionMismatch project(s, zeros(s.total_params + 1))
     end
@@ -130,6 +131,9 @@ const PY_MIXED_COORDS_R8_CAP256 = [63, 128, 55, 10]
         s = (@test_logs (:warn,) match_mode = :any HybridSubspace(dn; rank = 8,
                                                                   max_subspace_dim = 512))
         @test subspace_dim(s) == 1287
+        # 0 is a real cap: unprojected 138 plus one per projected layer
+        s0 = (@test_logs (:warn,) HybridSubspace(mixed; rank = 4, max_subspace_dim = 0))
+        @test subspace_dim(s0) == 140
         @test_throws ArgumentError HybridSubspace(dn; rank = 0)
     end
 
@@ -141,10 +145,21 @@ const PY_MIXED_COORDS_R8_CAP256 = [63, 128, 55, 10]
         X = reconstruct_batch(s, base, Z)
         @test size(X) == (s.total_params, 5)
         for j in 1:5
-            @test X[:, j] ≈ base .+ expand(s, Z[:, j])
+            @test isapprox(X[:, j], base .+ expand(s, Z[:, j]))
         end
         g = subspace_objective(columnwise(x -> sum(abs2, x)), s, base)
-        @test g(Z) ≈ [sum(abs2, X[:, j]) for j in 1:5]
+        @test isapprox(g(Z), [sum(abs2, X[:, j]) for j in 1:5])
+        Xv = reconstruct_batch(s, base, view(Z, :, 2:4))
+        for j in 1:3
+            @test isapprox(Xv[:, j], base .+ expand(s, Z[:, j + 1]))
+        end
+        s32 = HybridSubspace(layout; rank = 2, seed = 1, T = Float32)
+        X32 = reconstruct_batch(s32, base, Z)
+        @test eltype(X32) == Float32
+        for j in 1:5
+            @test isapprox(X32[:, j], base .+ expand(s32, Z[:, j]))
+        end
+        @test sprint(show, s) == "HybridSubspace(2 layers, dim=26/30, rank=2)"
     end
 
     @testset "quadratic optimized in the subspace" begin
@@ -165,8 +180,8 @@ const PY_MIXED_COORDS_R8_CAP256 = [63, 128, 55, 10]
         st = init_state(cfg, zeros(d, 1))
         solve!(g, cfg, st; rng = Xoshiro(17))
         best = base .+ expand(s, st.best_x)
-        @test sum(abs2, best .- target) ≈ st.best_f atol = 1e-8
+        @test isapprox(sum(abs2, best .- target), st.best_f; atol = 1e-8)
         @test st.best_f < 1e-3 * f0
-        @test project(s, best .- base) ≈ st.best_x atol = 1e-10
+        @test isapprox(project(s, best .- base), st.best_x; atol = 1e-10)
     end
 end

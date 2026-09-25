@@ -80,6 +80,8 @@ isrotation(Q; atol = 1e-8) = isapprox(Q' * Q, I; atol) && isapprox(det(Q), 1; at
         R2 = zeros(d, d, P)
         haar_rotations!(R2, zeros(d, d, P), Xoshiro(7))
         @test R2 == R
+        R3 = zeros(d, d, P)
+        @test haar_rotations!(R3, R3, Xoshiro(7)) == R   # Z may alias R
         if d == 2
             for p in 1:P
                 @test isapprox(R[1, 1, p], R[2, 2, p])
@@ -103,8 +105,42 @@ isrotation(Q; atol = 1e-8) = isapprox(Q' * Q, I; atol) && isapprox(det(Q), 1; at
         R1 = zeros(d, d, P)
         R2 = zeros(d, d, P)
         _qr_slices_static!(R1, copy(Z), Val(d))
-        _qr_slices_lapack!(R2, copy(Z))       # mutates its Z copy
+        _qr_slices_lapack!(R2, copy(Z))
         @test isapprox(R1, R2; rtol = 1e-10)
+    end
+
+    @testset "static path SO(d) on a zero subcolumn" begin
+        # StaticArrays skips the reflector for a zero subcolumn; the sign must not assume D-1
+        R0 = zeros(4, 4, 1)
+        _qr_slices_static!(R0, zeros(4, 4, 1), Val(4))
+        @test det(R0[:, :, 1]) > 0
+    end
+
+    @testset "Float32 d=512 stays in SO(d)" begin
+        # a Float32 LU det of a large rotation underflows to +-0; check the sign in Float64
+        d, P = 512, 4
+        rng = Xoshiro(1)
+        R = zeros(Float32, d, d, P)
+        haar_rotations!(R, R, rng)
+        @test all(p -> det(Float64.(R[:, :, p])) > 0, 1:P)
+        bias = randn(rng, Float32, d, P)
+        bias ./= sqrt.(sum(abs2, bias; dims = 1))
+        biased_rotation!(R, bias)
+        @test all(p -> det(Float64.(R[:, :, p])) > 0, 1:P)
+        @test isapprox(R[:, 1, :], bias; atol = 1e-5)
+    end
+
+    @testset "generic QR for non-BLAS types (BigFloat d=10)" begin
+        d, P = 10, 2
+        R = zeros(BigFloat, d, d, P)
+        haar_rotations!(R, R, Xoshiro(4))
+        bias = BigFloat.(randn(Xoshiro(5), d, P))
+        bias ./= sqrt.(sum(abs2, bias; dims = 1))
+        biased_rotation!(R, bias)
+        for p in 1:P
+            @test isrotation(R[:, :, p])
+            @test isapprox(R[:, 1, p], bias[:, p]; atol = 1e-30)
+        end
     end
 
     @testset "biased rotation d=$d" for d in (2, 3, 6, 12)
@@ -122,6 +158,11 @@ isrotation(Q; atol = 1e-8) = isapprox(Q' * Q, I; atol) && isapprox(det(Q), 1; at
             # column 1 must equal the bias itself, not its negation
             @test isapprox(R[:, 1, p], bias[:, p]; atol = 1e-8)
         end
+        # column 1 is replaced by the bias, so a NaN there must not block the fix
+        R[:, 1, 1] .= NaN
+        biased_rotation!(R, bias)
+        @test isrotation(R[:, :, 1])
+        @test isapprox(R[:, 1, 1], bias[:, 1]; atol = 1e-8)
     end
 
     @testset "biased rotation sign-ambiguous case" begin
@@ -134,5 +175,47 @@ isrotation(Q; atol = 1e-8) = isapprox(Q' * Q, I; atol) && isapprox(det(Q), 1; at
         biased_rotation!(R, bias)
         @test isapprox(R[:, 1, 1], bias[:, 1]; atol = 1e-12)
         @test isrotation(R[:, :, 1])
+    end
+
+    @testset "biased rotation frame is unbiased d=$d" for d in (4, 12)
+        # a fixed bias must leave columns 2..d uniform on its complement (mean 0)
+        P = 20_000
+        R = zeros(d, d, P)
+        haar_rotations!(R, R, Xoshiro(5))
+        b0 = normalize(randn(Xoshiro(6), d))
+        biased_rotation!(R, repeat(b0, 1, P))
+        @test maximum(j -> norm(mean(R[:, j, :]; dims = 2)), 2:d) < 0.05
+    end
+
+    @testset "biased rotation d=1 is the identity" begin
+        @test biased_rotation!(ones(1, 1, 3), [1.0 -1.0 1.0]) == ones(1, 1, 3)
+    end
+
+    @testset "rotations do not depend on the thread count" begin
+        # same seeded calls in child processes with 1 and 4 threads; d=300 takes
+        # the threaded LAPACK loop, d=1 the biased early return
+        script = """
+        using PolyStep, Random
+        open(ARGS[1], "w") do io
+            for d in (1, 5, 20, 300)
+                R = zeros(d, d, 4)
+                rng = Xoshiro(d)
+                haar_rotations!(R, R, rng)
+                write(io, R)
+                b = randn(rng, d, 4)
+                b ./= sqrt.(sum(abs2, b; dims = 1))
+                biased_rotation!(R, b)
+                write(io, R)
+            end
+        end
+        """
+        paths = [tempname() for _ in 1:2]
+        procs = map((1, 4), paths) do nt, path
+            run(`$(Base.julia_cmd()) --threads=$nt --project=$(Base.active_project())
+                -e $script $path`; wait = false)
+        end
+        foreach(wait, procs)
+        @test all(success, procs)
+        @test read(paths[1]) == read(paths[2])
     end
 end

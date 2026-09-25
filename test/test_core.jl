@@ -1,7 +1,7 @@
 using PolyStep
 using PolyStep: _resolve_radii, _batched_mul!, _batched_matvec!, normalize_particle_masses!,
                  fd_gradient!, fd_hessian_diag!, newton_step!, predicted_improvement,
-                 update_trust_region,
+                 predicted_improvement_mean, update_trust_region,
                  momentum_coefficient, update_adaptive_radius, solve
 
 sphere(X) = vec(sum(abs2, X; dims = 1))
@@ -37,46 +37,64 @@ sphere(X) = vec(sum(abs2, X; dims = 1))
         c = randn(rng, d)
         fq(x) = 0.5 * sum(D .* (x .- c) .^ 2)
         X = randn(rng, d, P)
-        pr = 0.05
         scales = PolyStep.probe_scales(Float64, K)
-        losses3 = zeros(K, 2d, P)
-        for p in 1:P, i in 1:d, (sgn, off) in ((1.0, 0), (-1.0, d)), k in 1:K
-            losses3[k, i + off, p] = fq(X[:, p] .+ (pr * scales[k] * sgn) .* R[:, i, p])
-        end
         G = zeros(d, P);
         H = zeros(d, P)
-        fd_gradient!(G, losses3, scales, pr)
-        fd_hessian_diag!(H, losses3, scales, pr)
-        for p in 1:P
-            grad_true = D .* (X[:, p] .- c)
-            @test isapprox(G[:, p], R[:, :, p]' * grad_true; atol = 1e-8)  # rotated frame
-            Hrot = R[:, :, p]' * Diagonal(D) * R[:, :, p]
-            @test isapprox(H[:, p], diag(Hrot); atol = 1e-8)
+        # 2e-3 is the default late-schedule probe radius; H must not collapse there
+        for pr in (0.05, 2e-3)
+            losses3 = zeros(K, 2d, P)
+            for p in 1:P, i in 1:d, (sgn, off) in ((1.0, 0), (-1.0, d)), k in 1:K
+                losses3[k, i + off, p] = fq(X[:, p] .+ (pr * scales[k] * sgn) .* R[:, i, p])
+            end
+            fd_gradient!(G, losses3, scales, pr)
+            fd_hessian_diag!(H, losses3, scales, pr)
+            for p in 1:P
+                grad_true = D .* (X[:, p] .- c)
+                @test isapprox(G[:, p], R[:, :, p]' * grad_true; atol = 1e-8)  # rotated frame
+                Hrot = R[:, :, p]' * Diagonal(D) * R[:, :, p]
+                @test isapprox(H[:, p], diag(Hrot); atol = 1e-8)
+            end
         end
         # newton step norm clipped
         N = zeros(d, P)
         newton_step!(N, G, H; max_step_norm = 0.01)
         @test all(p -> norm(N[:, p]) <= 0.01 + 1e-12, 1:P)
         @test all(<=(0), predicted_improvement(G, H, N))            # descent step predicts improvement
+        # the mean form scores a realized move X1 - X in the rotated frame
+        X1 = X .+ 0.1 .* randn(rng, d, P)
+        S = reduce(hcat, [R[:, :, p]' * (X1[:, p] - X[:, p]) for p in 1:P])
+        @test isapprox(predicted_improvement_mean(G, H, R, X1, X),
+            mean(predicted_improvement(G, H, S)))
     end
 
     @testset "probe point layout (k fastest, then v, then p)" begin
-        d, P, K = 3, 4, 2
+        d, K = 3, 2
         V = 2d
         rng = Xoshiro(77)
-        X = randn(rng, d, P)
-        R = zeros(d, d, P)
-        haar_rotations!(R, zeros(d, d, P), rng)
         scales = PolyStep.probe_scales(Float64, K)
         pr = 0.6
-        Xp = zeros(d, K * V * P)
-        PolyStep._probe_points_orthoplex!(Xp, X, R, pr, scales)
-        # column c = (p-1)*V*K + (v-1)*K + k; v=i is +e_i, v=d+i is -e_i
-        for p in 1:P, i in 1:d, k in 1:K
-            cplus = (p - 1) * V * K + (i - 1) * K + k
-            cminus = (p - 1) * V * K + (d + i - 1) * K + k
-            @test isapprox(Xp[:, cplus], X[:, p] .+ pr * scales[k] .* R[:, i, p]; atol = 1e-12)
-            @test isapprox(Xp[:, cminus], X[:, p] .- pr * scales[k] .* R[:, i, p]; atol = 1e-12)
+        # serial path and the threaded path past _KERNEL_BATCH_MIN particles
+        for P in (4, PolyStep._KERNEL_BATCH_MIN)
+            X = randn(rng, d, P)
+            R = zeros(d, d, P)
+            haar_rotations!(R, zeros(d, d, P), rng)
+            Xp = zeros(d, K * V * P)
+            PolyStep._probe_points_orthoplex!(Xp, X, R, pr, scales)
+            # column c = (p-1)*V*K + (v-1)*K + k; v=i is +e_i, v=d+i is -e_i
+            Xref = similar(Xp)
+            for p in 1:P, i in 1:d, k in 1:K
+                cplus = (p - 1) * V * K + (i - 1) * K + k
+                cminus = (p - 1) * V * K + (d + i - 1) * K + k
+                Xref[:, cplus] = X[:, p] .+ pr * scales[k] .* R[:, i, p]
+                Xref[:, cminus] = X[:, p] .- pr * scales[k] .* R[:, i, p]
+            end
+            @test isapprox(Xp, Xref; atol = 1e-12)
+            # general-polytope kernel with the orthoplex directions gives the same points
+            Xg = zeros(d, K * V * P)
+            dirs = zeros(d, V, P)
+            _batched_mul!(dirs, R, orthoplex_vertices(d))
+            PolyStep._probe_points_general!(Xg, X, dirs, pr, scales)
+            @test isapprox(Xg, Xref; atol = 1e-12)
         end
     end
 
@@ -110,6 +128,13 @@ sphere(X) = vec(sum(abs2, X; dims = 1))
         @test st0.X == stc.X
     end
 
+    @testset "objective must return one cost per column" begin
+        ps = PolyStepConfig(dim = 3)
+        @test_throws DimensionMismatch step!(X -> sum(X), ps, init_state(ps, zeros(3, 2)))  # forgot columnwise
+        psc = PolyStepConfig(dim = 3, eval_chunk = 5)
+        @test_throws DimensionMismatch step!(X -> [1.0], psc, init_state(psc, zeros(3, 2)))
+    end
+
     @testset "jitter=0 consumes no rng" begin
         ps0 = PolyStepConfig(dim = 3, probe_radius_jitter = 0.0)
         psj = PolyStepConfig(dim = 3, probe_radius_jitter = 0.1)
@@ -141,10 +166,35 @@ sphere(X) = vec(sum(abs2, X; dims = 1))
         end
         @test !isempty(st.trust_multipliers)
         @test all(isfinite, st.trust_multipliers)
-        # the ratio update actually moved the radius off its initial 1.0 (the
-        # [0.1, 3.0] clamp range is trivially satisfied, so it is not a real check)
+        # the ratio update moved the radius off its initial 1.0
         @test any(!=(1.0), st.trust_multipliers)
         @test st.prev_descent !== nothing && all(isfinite, st.prev_descent)
+    end
+
+    @testset "momentum + Newton + trust region score the realized move" begin
+        ps = PolyStepConfig(dim = 4, epsilon = 0.3, num_probe = 3, use_quadratic_model = true,
+            newton_refinement = true, newton_alpha = 0.5, trust_region = true,
+            use_momentum = true, velocity_lr = 0.8)
+        st = init_state(ps, randn(Xoshiro(25), 4, 6))
+        rng = Xoshiro(26)
+        for _ in 1:8
+            step!(sphere, ps, st; rng)
+            # an accepted refinement keeps the heavy-ball identity X - Xprev == lr*v
+            @test isapprox(st.X - st.Xprev, ps.velocity_lr .* st.velocity; atol = 1e-12)
+            # the trust-region prediction is for the move actually taken
+            @test st.prev_predicted ==
+                  predicted_improvement_mean(st.G, st.H, st.R, st.X, st.Xprev)
+        end
+    end
+
+    @testset "fixed-iteration Sinkhorn gives ProgressiveEpsilon no feedback" begin
+        ps = PolyStepConfig(dim = 3, ent_epsilon = ProgressiveEpsilon(init = 0.1, target = 0.01),
+            solver = SinkhornSolver(threshold = 0.0, max_iterations = 20))
+        st = init_state(ps, randn(Xoshiro(27), 3, 4))
+        for _ in 1:5
+            step!(sphere, ps, st; rng = Xoshiro(28))
+        end
+        @test st.prog_ent.smoothed == 0.1 && st.last_eps == 0.1   # not inflated
     end
 
     @testset "newton refinement invalidates duals" begin
@@ -212,6 +262,11 @@ sphere(X) = vec(sum(abs2, X; dims = 1))
         st_r = init_state(ps_r, randn(Xoshiro(17), 3, 4))
         step!(sphere, ps_r, st_r; rng = Xoshiro(18))
         @test all(x -> isapprox(x, round(x * 2) / 2; atol = 1e-12), st_r.best_x)
+        # solve! scores a repaired copy of the iterate, so best_x stays on the grid
+        st_s = init_state(ps_r, randn(Xoshiro(17), 3, 4))
+        solve!(sphere, ps_r, st_s; rng = Xoshiro(18))
+        @test all(x -> isapprox(x, round(x * 2) / 2; atol = 1e-12), st_s.best_x)
+        @test isapprox(st_s.best_f, sum(abs2, st_s.best_x))
     end
 
     @testset "projection identity on unconverged plans" begin
@@ -255,9 +310,20 @@ sphere(X) = vec(sum(abs2, X; dims = 1))
         solve!(sphere, ps, st; rng = Xoshiro(21))
         @test 1 <= st.iteration <= 30
         @test length(st.costs) == st.iteration == length(st.disp_sqnorms)
+        # the final iterate is scored once (P evals); probes alone sit a radius off it
+        @test st.evals == st.iteration * 6 * 8 + 8
+        @test st.best_f <= minimum(sphere(st.X))
+        # orthoplex centroid (+/- weight difference) is bit-identical to Vt * Wn
+        @test st.cent == orthoplex_vertices(3) * st.Wn
         stc = init_state(ps, randn(Xoshiro(20), 3, 8))
         solve!(sphere, ps, stc; rng = Xoshiro(21), callback = s -> s.iteration >= 2)
         @test stc.iteration == 2
+        # convergence is only checked after min_iterations steps
+        flat(X) = fill(1.0, size(X, 2))
+        psf = PolyStepConfig(dim = 3, min_iterations = 5)
+        stf = init_state(psf, randn(Xoshiro(20), 3, 4))
+        solve!(flat, psf, stf; rng = Xoshiro(21))
+        @test stf.iteration == 5
     end
 
     @testset "columnwise adapter" begin
@@ -279,6 +345,15 @@ sphere(X) = vec(sum(abs2, X; dims = 1))
         @test_throws ArgumentError init_state(PolyStepConfig(dim = 3, ent_epsilon = ProgressiveEpsilon()), zeros(3, 2))
         @test_throws DimensionMismatch init_state(PolyStepConfig(dim = 4), zeros(3, 2))
         @test_throws ArgumentError init_state(PolyStepConfig(dim = 3, lb = -1.0), zeros(3, 2))
+        # a non-finite particle would freeze every particle through the NaN revert
+        @test_throws ArgumentError init_state(PolyStepConfig(dim = 2), [0.0 NaN; 0.0 0.0])
+        # scale_cost typos fail at construction, before any objective evaluation
+        @test_throws ArgumentError init_state(PolyStepConfig(dim = 2, scale_cost = :meen), zeros(2, 2))
+        @test_throws ArgumentError init_state(PolyStepConfig(dim = 2, scale_cost = -1.0), zeros(2, 2))
+        # epsilon = Inf only with scheduled radii (unscheduled ones scale by it)
+        @test_throws ArgumentError init_state(PolyStepConfig(dim = 2, epsilon = Inf), zeros(2, 2))
+        @test init_state(PolyStepConfig(dim = 2, epsilon = Inf, step_radius = LinearEpsilon(),
+            probe_radius = LinearEpsilon()), zeros(2, 2)).iteration == 0
         # ProgressiveEpsilon works with Sinkhorn
         ps = PolyStepConfig(dim = 3, ent_epsilon = ProgressiveEpsilon(),
             solver = SinkhornSolver(max_iterations = 100))

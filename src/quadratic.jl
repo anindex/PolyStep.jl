@@ -27,25 +27,27 @@ end
 """
     fd_hessian_diag!(H, losses3, scales, probe_radius) -> H
 
-Regress the symmetric sum `L(+s) + L(-s) = 2a + H*s^2` on centered `s^2`.
-`H` is in the rotated frame, shape (d, P).
+Regress the symmetric sum `L(+s) + L(-s) = 2a + H*s^2` on centered unit-scale
+`scales[k]^2`, then divide by `probe_radius^2`, so the floor on the regression
+denominator does not depend on the radius. `H` is in the rotated frame, shape (d, P).
 """
 function fd_hessian_diag!(H::AbstractMatrix{T}, losses3::AbstractArray{T, 3},
         scales::AbstractVector, probe_radius::Real) where {T}
     K, V, P = size(losses3)
     d = size(H, 1)
     V == 2d || throw(DimensionMismatch("FD Hessian needs orthoplex (V == 2d); got V=$V, d=$d"))
-    # centered s^2 regression, no K-length temporaries (zero-alloc kernel)
+    # centered s^2 regression, zero-alloc
     s_mean = zero(T)
     @inbounds for k in 1:K
-        s_mean += T((scales[k] * probe_radius)^2)
+        s_mean += T(scales[k]^2)
     end
     s_mean /= K
     denom = zero(T)
     @inbounds for k in 1:K
-        denom += (T((scales[k] * probe_radius)^2) - s_mean)^2
+        denom += (T(scales[k]^2) - s_mean)^2
     end
-    denom = max(denom, T(1e-10))
+    # r-free floor, then convert unit s^2 to (s*r)^2
+    denom = max(denom, T(1e-10)) * max(T(probe_radius)^2, floatmin(T))
     @inbounds for p in 1:P, i in 1:d
         sym_mean = zero(T)
         for k in 1:K
@@ -54,7 +56,7 @@ function fd_hessian_diag!(H::AbstractMatrix{T}, losses3::AbstractArray{T, 3},
         sym_mean /= K
         num = zero(T)
         for k in 1:K
-            s_c = T((scales[k] * probe_radius)^2) - s_mean
+            s_c = T(scales[k]^2) - s_mean
             num += s_c * ((losses3[k, i, p] + losses3[k, d + i, p]) - sym_mean)
         end
         H[i, p] = num / denom
@@ -110,22 +112,25 @@ function predicted_improvement(G::AbstractMatrix{T}, H::AbstractMatrix{T},
 end
 
 """
-    predicted_improvement_mean(G, H, S; scale=1) -> Float64
+    predicted_improvement_mean(G, H, R, X, X0) -> Float64
 
-Mean over particles of the quadratic-model loss change for the step `scale*S`
-in the rotated frame, `g'delta + 0.5 delta'H delta` (negative = improvement).
-Allocation-free companion to `predicted_improvement` for the trust-region ratio.
+Mean over particles of the quadratic-model loss change `g's + 0.5 s'H s` for the
+realized move `X - X0`, taken in the rotated frame `s = R[:, :, p]' (X - X0)[:, p]`
+where `G`/`H` live (negative = improvement). Allocation-free companion to
+`predicted_improvement` for the trust-region ratio.
 """
 function predicted_improvement_mean(G::AbstractMatrix{T}, H::AbstractMatrix{T},
-        S::AbstractMatrix{T}; scale::Real = one(T)) where {T}
+        R::AbstractArray{T, 3}, X::AbstractMatrix{T}, X0::AbstractMatrix{T}) where {T}
     d, P = size(G)
     P == 0 && return 0.0
-    sc = T(scale)
     acc = 0.0
     @inbounds for p in 1:P
         a = zero(T)
-        @simd for i in 1:d
-            s = sc * S[i, p]
+        for i in 1:d
+            s = zero(T)
+            @simd for j in 1:d      # R' rows = R columns
+                s += R[j, i, p] * (X[j, p] - X0[j, p])
+            end
             a += G[i, p] * s + T(0.5) * H[i, p] * s^2
         end
         acc += Float64(a)
@@ -166,8 +171,7 @@ function newton_refinement!(Xout::AbstractMatrix{T}, X_bary::AbstractMatrix{T},
     copyto!(Xout, X_bary)
     @inbounds for p in 1:P
         (mask !== nothing && mask[p]) && continue
-        # tentative refined position for particle p; the rotated-frame gate below
-        # reads it back as X_ref
+        # tentative blend, read back by the descent gate below
         for i in 1:d
             Xout[i, p] = (1 - a) * X_bary[i, p] + a * (X_current[i, p] + refrot[i, p])
         end
@@ -183,7 +187,7 @@ function newton_refinement!(Xout::AbstractMatrix{T}, X_bary::AbstractMatrix{T},
             pred_ot += G[i, p] * ot_i + T(0.5) * H[i, p] * ot_i^2
             pred_ref += G[i, p] * ref_i + T(0.5) * H[i, p] * ref_i^2
         end
-        if !(pred_ref <= pred_ot)      # reject: restore X_bary for this particle
+        if !(pred_ref <= pred_ot)      # reject (NaN too): restore X_bary
             for j in 1:d
                 Xout[j, p] = X_bary[j, p]
             end

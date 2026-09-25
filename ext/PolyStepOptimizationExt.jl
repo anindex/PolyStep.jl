@@ -1,6 +1,4 @@
-# Optimization.jl (SciML) adapter: current cache-based API (OptimizationBase
-# v5 `__solve(cache::OptimizationCache)`), mirroring the structure of
-# OptimizationCMAEvolutionStrategy.
+# Optimization.jl adapter (OptimizationBase v5 cache-based `__solve`)
 module PolyStepOptimizationExt
 
 using PolyStep
@@ -23,7 +21,8 @@ function SciMLBase.__solve(cache::OptimizationBase.OptimizationCache{O}) where {
     T = float(eltype(u0))
     dim = length(u0)
     maxiters = OptimizationBase._check_and_convert_maxiters(cache.solver_args.maxiters)
-    rounds = maxiters === nothing ? 1000 : maxiters
+    maxtime = OptimizationBase._check_and_convert_maxtime(cache.solver_args.maxtime)
+    rounds = maxiters !== nothing ? maxiters : maxtime !== nothing ? typemax(Int) : 1000
     batched = get(cache.solver_args, :batched, nothing)
     rng = get(cache.solver_args, :rng, Random.Xoshiro(0))
     if batched === nothing
@@ -32,26 +31,31 @@ function SciMLBase.__solve(cache::OptimizationBase.OptimizationCache{O}) where {
               "`batched = f` (f(X::AbstractMatrix)::Vector) through solve kwargs, or " *
               "use PolyStep.minimize directly." maxlog = 1
     end
+    (cache.solver_args.abstol === nothing && cache.solver_args.reltol === nothing) ||
+        @warn "abstol/reltol are not used by PolyStepOptimizer (budget-only)" maxlog = 1
+
+    # the ES works on flat vectors; values handed back to the user get u0's shape
+    shaped(x) = copyto!(similar(u0, T), x)
+    flat(b) = b isa AbstractArray ? vec(b) : b
+    # cache.f is already negated for MaxSense, the user's batched f is not
+    sgn = cache.sense === SciMLBase.MaxSense ? -1.0 : 1.0
+    fitness(X) = batched === nothing ?
+                 [Float64(first(cache.f(shaped(view(X, :, j)), cache.p))) for j in 1:size(X, 2)] :
+                 sgn .* Vector{Float64}(batched(X))
 
     es = PolyStepES(dim; num_particles = opt.num_particles, epsilon = opt.epsilon,
         step_radius = opt.step_radius, solver = opt.solver,
-        scale_cost = opt.scale_cost, x0 = Vector{T}(u0),
-        lb = cache.lb, ub = cache.ub, rng = rng, T = T)
+        scale_cost = opt.scale_cost, x0 = Vector{T}(vec(u0)),
+        lb = flat(cache.lb), ub = flat(cache.ub), rng = rng, T = T)
 
     t0 = time()
     done = 0
     halted = false
+    timedout = false
     for round in 1:rounds
-        X = ask!(es)
-        fitness = if batched === nothing
-            # candidates handed to the user objective as plain Vector{eltype(u0)}
-            [Float64(first(cache.f(X[:, j], cache.p))) for j in 1:size(X, 2)]
-        else
-            Vector{Float64}(batched(X))
-        end
-        tell!(es, fitness)
+        tell!(es, fitness(ask!(es)))
         done = round
-        state = OptimizationBase.OptimizationState(; iter = round, u = es.best_x,
+        state = OptimizationBase.OptimizationState(; iter = round, u = shaped(es.best_x),
             p = cache.p, objective = es.best_f,
             original = es)
         halt = cache.callback(state, es.best_f)
@@ -61,17 +65,23 @@ function SciMLBase.__solve(cache::OptimizationBase.OptimizationCache{O}) where {
             halted = true
             break
         end
+        if maxtime !== nothing && time() - t0 >= maxtime
+            timedout = true
+            break
+        end
     end
+    PolyStep._score_iterate!(es, fitness)
     t1 = time()
 
     stats = OptimizationBase.OptimizationStats(; iterations = done, time = t1 - t0,
         fevals = es.evals)
-    # budget-only optimizer: exhausting the budget is the normal, successful
-    # exit; a callback halt reports Terminated so callers can distinguish it
-    retcode = halted ? SciMLBase.ReturnCode.Terminated : SciMLBase.ReturnCode.Success
-    return SciMLBase.build_solution(cache, opt, es.best_x, es.best_f;
-        original = es, retcode = retcode,
-        stats = stats)
+    # budget-only: exhausting the budget is Success; no finite value returns u0
+    found = isfinite(es.best_f)
+    retcode = !found ? SciMLBase.ReturnCode.Failure :
+              halted ? SciMLBase.ReturnCode.Terminated :
+              timedout ? SciMLBase.ReturnCode.MaxTime : SciMLBase.ReturnCode.Success
+    return SciMLBase.build_solution(cache, opt, found ? shaped(es.best_x) : copy(u0),
+        es.best_f; original = es, retcode = retcode, stats = stats)
 end
 
 end

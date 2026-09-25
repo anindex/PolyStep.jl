@@ -1,21 +1,12 @@
-# Shared numeric kernels. Layout: cost/plan are (V, P), reductions over dims=1 are
-# contiguous. Each kernel has an Array fast path and a broadcast generic method
-# that runs on GPU arrays.
+# Shared numeric kernels. cost/plan are (V, P), so dims=1 reductions are contiguous.
+# Each kernel has an Array fast path and a generic broadcast method for GPU arrays.
 
-# Warn threshold: below eps/max|C| ~ 1e-6 the iterative log-kernel -C/eps can
-# overflow before its max subtraction. The softmax path forms cmin-C first and
-# is safe; this bounds only the Sinkhorn/KL log-domain solvers.
-const TINY_EPSILON_RATIO = 1e-6
-
-# SLEEFPirates exp is branch-free polynomial code the LLVM loop vectorizer can
-# SIMD; Base.exp (table-based) cannot.
+# SLEEFPirates exp is branch-free and SIMD-vectorizes; table-based Base.exp does not
 @inline exp_fast(x::Float64) = SLEEFPirates.exp(x)
 @inline exp_fast(x::Float32) = SLEEFPirates.exp(x)
 @inline exp_fast(x) = exp(x)
 
-# The LoopVectorization extension defines the *_turbo! stubs and flips _TURBO_ACTIVE
-# (LV is a weakdep). A Bool flag plus a concrete stub keeps dispatch static and
-# allocation-free (an abstract-typed Ref boxes 16 B/call).
+# set by the LoopVectorization extension; a Bool flag keeps dispatch static and alloc-free
 const _TURBO_ACTIVE = Ref(false)
 function _lse_cols_turbo! end
 function _lse_rows_turbo! end
@@ -34,16 +25,15 @@ function splitmix64(z::UInt64)
     return xor(z, z >> 31)
 end
 function splitmix64(seed::Integer, extras::Integer...)
-    z = splitmix64(reinterpret(UInt64, Int64(seed)))
+    # modular cast, so UInt64 seeds >= 2^63 work
+    z = splitmix64(seed % UInt64)
     for e in extras
-        z = splitmix64(xor(z, reinterpret(UInt64, Int64(e))))
+        z = splitmix64(xor(z, e % UInt64))
     end
     return z
 end
 
-# NaN-safe incumbent scan: findmin returns (NaN, i) when any entry is NaN,
-# which would discard a batch's finite candidates. Non-finite entries (NaN,
-# +-Inf) never win here; bidx == 0 means no finite entry exists.
+# NaN-safe argmin (findmin returns NaN if any entry is NaN); bidx == 0: none finite
 function _best_finite(x::AbstractVector)
     bf = Inf
     bidx = 0
@@ -57,27 +47,25 @@ function _best_finite(x::AbstractVector)
     return bf, bidx
 end
 
+# thread only past this many columns; below it spawn overhead dominates
+const _KERNEL_BATCH_MIN = 1024
+
 """
     softmax_cols!(W, C, eps) -> W
 
 `W[:, p] = softmax(-C[:, p] / eps)` with column-max subtraction before `exp`
 (torch.softmax subtracts internally; forgetting this overflows at small eps).
 """
-# column-parallel kernels thread only past this many columns: below it the
-# Polyester task-spawn overhead (~us) exceeds the whole kernel's work, and the
-# serial path is also exactly allocation-free (asserted in test_zero_alloc)
-const _KERNEL_BATCH_MIN = 1024
-
 function softmax_cols!(W::Matrix{T}, C::Matrix{T}, eps::Real) where {T <: AbstractFloat}
     V, P = size(C)
     size(W) == (V, P) || throw(DimensionMismatch("W $(size(W)) vs C $(size(C))"))
-    # eps = Inf is the uniform limit; take it directly, since 1/Inf = 0 makes
-    # (cmin - C)/eps a NaN whenever cmin - C overflows to -Inf at extreme costs
+    # uniform limit taken directly: -Inf * (1/Inf) would be NaN at extreme costs
     if isinf(eps)
         fill!(W, one(T) / V)
         return W
     end
-    invabseps = one(T) / T(eps)
+    # floatmax clamp: 1/eps = Inf would give 0*Inf = NaN at the argmin
+    invabseps = min(one(T) / T(eps), floatmax(T))
     if P >= _KERNEL_BATCH_MIN
         @batch for p in 1:P
             _softmax_col!(W, C, invabseps, V, p)
@@ -93,9 +81,8 @@ end
 @inline function _softmax_col!(
         W::AbstractMatrix{T}, C::AbstractMatrix{T}, invabseps::T, V::Int, p::Int) where {T}
     @inbounds begin
-        # subtract the raw column min before dividing by eps: (cmin - C) stays
-        # bounded, while -C/eps can overflow to -Inf for large |C| and break the
-        # max subtraction. The cmin term gives exp(0) = 1, so the normalizer is >= 1.
+        # shift by the column min before scaling (-C/eps can overflow); the argmin
+        # term is exp(0) = 1, so the normalizer is >= 1
         cmin = C[1, p]
         @simd for v in 2:V
             cv = C[v, p]
@@ -116,14 +103,13 @@ end
 end
 
 function softmax_cols!(W::AbstractMatrix{T}, C::AbstractMatrix, eps::Real) where {T}
-    # softmax(-C/eps) with max subtraction == exp((cmin - C)/eps) normalized.
-    # Base exp: GPU-broadcast safe (SLEEFPirates is CPU-only).
-    if isinf(eps)                       # uniform (infinite-temperature) limit
+    # Base exp: GPU-broadcast safe (SLEEFPirates is CPU-only)
+    if isinf(eps)
         W .= one(T) / size(C, 1)
         return W
     end
     cmin = minimum(C; dims = 1)
-    W .= exp.((cmin .- C) ./ T(eps))
+    W .= exp.((cmin .- C) .* min(one(T) / T(eps), floatmax(T)))   # see the Array method
     W ./= sum(W; dims = 1)
     return W
 end
@@ -211,10 +197,10 @@ end
 """
     sanitize_cost!(C) -> C
 
-Replace non-finite entries with `max(2*max|finite| + 1, 1e6)`: a finite
-penalty modeling "never pick this vertex" (port of solvers/_prelude.py and
-`_step_monolithic.py`; note Python's low-level `solver.py` omits the `1e6`
-floor; this port follows the richer monolithic reference).
+Replace non-finite entries with `2*max|finite| + 1` (clamped to `floatmax`): a
+finite penalty that ranks last, modeling "never pick this vertex". No absolute
+floor, as in the Python reference: a large floor would dominate the `:mean`/`:max`
+scale and flatten the weights over the finite vertices.
 """
 function sanitize_cost!(C::Array{T}) where {T <: AbstractFloat}
     maxabs = zero(T)
@@ -225,12 +211,11 @@ function sanitize_cost!(C::Array{T}) where {T <: AbstractFloat}
         fin = isfinite(c)
         allfinite &= fin
         a = ifelse(fin, abs(c), zero(T))
-        maxabs = max(maxabs, a)   # `a` is never NaN: max is a recognized simd reduction
+        maxabs = max(maxabs, a)   # `a` is never NaN, so max vectorizes
     end
     if !allfinite
-        # min against floatmax: 2*maxabs+1 overflows to Inf near floatmax,
-        # which would break the finite penalty
-        penalty = max(min(2 * maxabs + one(T), floatmax(T)), T(1e6))
+        # 2*maxabs+1 can overflow to Inf near floatmax
+        penalty = min(2 * maxabs + one(T), floatmax(T))
         @inbounds @simd ivdep for i in eachindex(C)
             c = C[i]
             C[i] = ifelse(isfinite(c), c, penalty)
@@ -243,7 +228,7 @@ function sanitize_cost!(C::AbstractArray{T}) where {T}
     allfinite = mapreduce(isfinite, &, C; init = true)
     if !allfinite
         maxabs = mapreduce(c -> ifelse(isfinite(c), abs(c), zero(T)), max, C; init = zero(T))
-        penalty = max(min(2 * maxabs + one(T), floatmax(T)), T(1e6))
+        penalty = min(2 * maxabs + one(T), floatmax(T))
         C .= ifelse.(isfinite.(C), C, penalty)
     end
     return C
@@ -253,27 +238,28 @@ end
     scale_cost!(Cs, C, spec) -> Cs
 
 Write the scaled solver input `Cs` from the raw (sanitized) cost `C`.
-`spec`: `nothing` (copy), `:mean` (`C / max(mean|C|, 1e-10)`),
-`:max` (`C / max(max|C|, 1e-10)`), or a finite positive real divisor.
+`spec`: `nothing` (copy), `:mean` (`(C - m) / mean(C - m)`), `:max`
+(`(C - m) / (max(C) - m)`), with `m = minimum(C)` and the divisor floored at
+`1e-10`, or a finite positive real divisor (`C / s`, no recentering).
+Recentering first makes `:mean`/`:max` shift-invariant, as in the Python
+reference: the temperature follows the spread of the costs, not their level.
 A negative divisor would reverse the objective (rejected).
-The `:mean`/`:max` divisors are magnitude-based, so a large constant offset on
-the cost lowers the effective softmax temperature (softmax and Sinkhorn are
-themselves shift-invariant); center the objective, or pass an explicit divisor,
-when the costs carry a large offset.
 """
 scale_cost!(Cs::AbstractMatrix, C::AbstractMatrix, ::Nothing) = copyto!(Cs, C)
 function scale_cost!(Cs::AbstractMatrix{T}, C::AbstractMatrix, spec::Symbol) where {T}
-    s = if spec === :mean
-        m = mean(abs, C)
-        # sum of many large finite |C| can overflow the mean to Inf; the max is
-        # finite whenever C is (this kernel runs on sanitized cost), so fall back
-        isfinite(m) ? m : maximum(abs, C)
-    elseif spec === :max || spec === :max_cost   # :max_cost = Python-name alias
-        maximum(abs, C)
+    # halves keep c/2 - m/2 finite even when C spans +-floatmax
+    m = minimum(C) / 2
+    h = if spec === :mean
+        v = mean(c -> c / 2 - m, C)
+        # the sum can overflow to Inf; the max is always finite, so fall back
+        isfinite(v) ? v : maximum(c -> c / 2 - m, C)
+    elseif spec === :max || spec === :max_cost   # :max_cost is the Python name
+        maximum(c -> c / 2 - m, C)
     else
         throw(ArgumentError("scale_cost spec must be nothing, :mean, :max, or a positive real; got :$spec"))
     end
-    Cs .= C ./ max(T(s), T(1e-10))
+    # floatmin: T(5e-11) is 0 in Float16, and a constant cost would give 0/0
+    Cs .= (C ./ 2 .- m) ./ max(T(h), T(5e-11), floatmin(T))
     return Cs
 end
 function scale_cost!(Cs::AbstractMatrix{T}, C::AbstractMatrix, s::Real) where {T}
@@ -342,8 +328,7 @@ end
         @simd for v in 1:V
             s += plan[v, p]
         end
-        # mass at/below the floor zeroes the column (particle holds), rather than
-        # dividing by the floor and taking a spurious sub-unit step
+        # mass at/below the floor zeroes the column so the particle holds
         invs = s > T(1e-12) ? one(T) / s : zero(T)
         @simd ivdep for v in 1:V
             Wn[v, p] = plan[v, p] * invs
@@ -379,14 +364,12 @@ function _batched_mul!(Y::AbstractArray{<:Any, 3}, A::AbstractArray{<:Any, 3}, B
     return Y
 end
 
+# hand-written gemv: faster than BLAS on views at small d, and allocation-free
 """
     _batched_matvec!(Y, A, X) -> Y
 
 `Y[:, p] = A[:, :, p] * X[:, p]` (per-particle rotation of a vector).
 """
-# direct column-major gemv per slice: at d <= 16 this beats the BLAS-via-view
-# loop (no view/dispatch overhead) and stays allocation-free. The CUDA extension
-# overrides this for CuArrays with a more specific method.
 function _batched_matvec!(
         Y::AbstractMatrix{T}, A::AbstractArray{<:Any, 3}, X::AbstractMatrix) where {T}
     d, P = size(Y)

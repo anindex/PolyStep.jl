@@ -11,23 +11,20 @@ struct ParamEntry
 end
 
 """
-    ParamLayout(params; particle_dim = 2)
+    ParamLayout(params)
 
 Flat layout of a model's parameter arrays, given as `name => shape` pairs, shapes, or arrays.
 """
 struct ParamLayout
     entries::Vector{ParamEntry}
     total_params::Int
-    padded_size::Int
-    particle_dim::Int
 end
 
 _param_shape(x::AbstractArray) = size(x)
 _param_shape(x::Tuple) = Dims(x)
 _param_shape(x::Integer) = (Int(x),)
 
-function ParamLayout(pairs::AbstractVector{<:Pair}; particle_dim::Int = 2)
-    particle_dim >= 1 || throw(ArgumentError("particle_dim must be >= 1, got $particle_dim"))
+function ParamLayout(pairs::AbstractVector{<:Pair})
     entries = ParamEntry[]
     offset = 0
     for (name, value) in pairs
@@ -36,13 +33,10 @@ function ParamLayout(pairs::AbstractVector{<:Pair}; particle_dim::Int = 2)
         push!(entries, ParamEntry(String(name), shape, offset, numel))
         offset += numel
     end
-    pad = offset == 0 ? 0 : offset + mod(-offset, particle_dim)
-    return ParamLayout(entries, offset, pad, particle_dim)
+    return ParamLayout(entries, offset)
 end
 
-function ParamLayout(params::AbstractVector; particle_dim::Int = 2)
-    return ParamLayout(["p$(i)" => p for (i, p) in enumerate(params)]; particle_dim = particle_dim)
-end
+ParamLayout(params::AbstractVector) = ParamLayout(["p$(i)" => p for (i, p) in enumerate(params)])
 
 Base.length(l::ParamLayout) = length(l.entries)
 
@@ -64,8 +58,17 @@ end
 """
     HybridSubspace(layout; rank, seed = 0, max_subspace_dim = nothing, T = Float64)
 
-Per-layer fixed orthonormal basis: `min(d_out*r + r*d_in, numel)` coordinates per 2-D array, 1-D and
-full-width arrays unprojected.
+Per-layer fixed orthonormal basis: `min(d_out*r + r*d_in, numel)` coordinates per array with
+2 or more dims, 1-D and full-width arrays unprojected. For N-D arrays `d_out` is the last axis
+and `d_in` the product of the others, so a Flux/Lux conv weight `(kw, kh, cin, cout)` has
+`d_out = cout`. The count is symmetric in `d_out` and `d_in`, so a 2-D `(out, in)` weight gets
+the same count either way. `max_subspace_dim` caps the total by shrinking the
+projected layers (`nothing` means no cap); a cap below the unprojected size plus one per
+projected layer warns and stops there.
+
+Each projected layer stores a dense `numel x ncoords` basis of eltype `T`. Unlike the Python
+version there is no sparse fallback for large layers: memory is `numel * ncoords * sizeof(T)`
+bytes per layer.
 """
 struct HybridSubspace{T <: AbstractFloat}
     specs::Vector{LayerSpec}
@@ -78,10 +81,15 @@ struct HybridSubspace{T <: AbstractFloat}
     max_subspace_dim::Int
 end
 
+function Base.show(io::IO, s::HybridSubspace)
+    print(io, "HybridSubspace(", length(s.specs), " layers, dim=", s.subspace_dim, "/",
+          s.total_params, ", rank=", s.rank, ")")
+end
+
 function _layer_coords(shape::Dims, numel::Int, rank::Int)
     length(shape) < 2 && return numel, false
-    d_out = shape[1]
-    d_in = prod(shape[2:end])
+    d_out = shape[end]
+    d_in = prod(shape[1:(end - 1)])
     er = min(rank, d_in, d_out)
     nc = min(d_out * er + er * d_in, numel)
     return nc, nc < numel
@@ -90,7 +98,7 @@ end
 function _scale_to_budget(ncoords::Vector{Int}, projected::Vector{Bool}, numels::Vector{Int},
                           max_dim::Int)
     total = sum(ncoords; init = 0)
-    (max_dim <= 0 || total <= max_dim) && return ncoords, projected
+    total <= max_dim && return ncoords, projected
     unprojected = sum(ncoords[k] for k in eachindex(ncoords) if !projected[k]; init = 0)
     n_projected = count(projected)
     target = max_dim - unprojected
@@ -119,15 +127,14 @@ end
 function _orthonormal_basis(::Type{T}, numel::Int, ncoords::Int, seed::UInt64) where {T}
     numel >= ncoords ||
         throw(ArgumentError("ncoords ($ncoords) exceeds numel ($numel): no orthonormal basis exists"))
-    A = randn(Xoshiro(seed), T, numel, ncoords)
-    return Matrix{T}(qr(A).Q * Matrix{T}(I, numel, ncoords))
+    return Matrix(qr!(randn(Xoshiro(seed), T, numel, ncoords)).Q)
 end
 
 function HybridSubspace(layout::ParamLayout; rank::Int, seed::Int = 0,
                         max_subspace_dim::Union{Nothing, Integer} = nothing,
                         T::Type{<:AbstractFloat} = Float64)
     rank >= 1 || throw(ArgumentError("rank must be >= 1, got $rank"))
-    max_dim = max_subspace_dim === nothing ? 0 : Int(max_subspace_dim)
+    max_dim = max_subspace_dim === nothing ? typemax(Int) : Int(max_subspace_dim)
     numels = [e.numel for e in layout.entries]
     ncoords = Vector{Int}(undef, length(numels))
     projected = Vector{Bool}(undef, length(numels))
@@ -237,12 +244,20 @@ function reconstruct_batch(s::HybridSubspace{T}, base::AbstractVector,
         throw(DimensionMismatch("base has length $(length(base)), expected $(s.total_params)"))
     size(Z, 1) == s.subspace_dim ||
         throw(DimensionMismatch("Z has $(size(Z, 1)) rows, expected $(s.subspace_dim)"))
+    # one GEMM per layer; convert Z once so mixed eltypes stay on BLAS
+    Zt = eltype(Z) === T ? Z : T.(Z)
     out = Matrix{T}(undef, s.total_params, size(Z, 2))
-    @inbounds for j in axes(Z, 2)
-        col = view(out, :, j)
-        expand!(col, s, view(Z, :, j))
-        col .+= base
+    @inbounds for k in eachindex(s.specs)
+        spec = s.specs[k]
+        rows = (spec.param_start + 1):(spec.param_start + spec.numel)
+        cols = (spec.flat_start + 1):(spec.flat_start + spec.ncoords)
+        if spec.projected
+            mul!(view(out, rows, :), s.projections[k], view(Zt, cols, :))
+        else
+            copyto!(view(out, rows, :), view(Zt, cols, :))
+        end
     end
+    out .+= base
     return out
 end
 
@@ -250,6 +265,12 @@ end
     subspace_objective(f, s, base) -> g
 
 Batched objective in subspace coordinates: `g(Z) = f(reconstruct_batch(s, base, Z))`.
+
+The coordinates form one `subspace_dim`-dimensional polytope; the Python optimizer instead
+splits them into 8-D particles, so the step shrinks as `d` grows: about as `1/d` with a fixed
+cost divisor, about as `1/sqrt(d)` at large `epsilon` with `scale_cost = :mean`. Lower the
+temperature if the steps stall: `ent_epsilon` in `PolyStepConfig` (its `epsilon` also scales
+both radii), or `epsilon` in `PolyStepES`/`minimize`.
 """
 function subspace_objective(f, s::HybridSubspace, base::AbstractVector)
     return Z -> f(reconstruct_batch(s, base, Z))
