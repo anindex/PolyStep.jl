@@ -13,7 +13,9 @@ jobs:
     runs-on: ubuntu-latest
     continue-on-error: ${{ matrix.version == 'nightly' }}
     env:
-      JULIA_NUM_THREADS: 2   # run the Polyester/@threads paths multithreaded
+      # multithreaded Polyester paths; nightly stays at 1 thread because
+      # ThreadingUtilities segfaults launching threads there
+      JULIA_NUM_THREADS: ${{ matrix.version == 'nightly' && '1' || '2' }}
     strategy:
       fail-fast: false
       matrix:
