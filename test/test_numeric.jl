@@ -17,6 +17,9 @@ ref_lse(x) = (m = maximum(x); m + log(sum(exp.(x .- m))))
         @test splitmix64(0, 1, 2) == splitmix64(0, 1, 2)
         @test splitmix64(0, 1, 2) != splitmix64(0, 2, 1)
         @test splitmix64(42) != splitmix64(43)
+        # UInt64 seeds >= 2^63 (e.g. a nested derivation) must not throw
+        @test splitmix64(splitmix64(42, 1), 2) isa UInt64
+        @test splitmix64(-5, 7) == splitmix64(xor(splitmix64(reinterpret(UInt64, -5)), UInt64(7)))
     end
 
     @testset "softmax_cols! T=$T" for T in (Float64, Float32)
@@ -37,6 +40,13 @@ ref_lse(x) = (m = maximum(x); m + log(sum(exp.(x .- m))))
         Wg = similar(C)
         softmax_cols!(Wg, view(C, :, :), eps)
         @test isapprox(Wg, W; rtol = (T === Float64 ? 1e-12 : 1e-5))
+        # tiny/subnormal eps (1/eps overflows) gives the one-hot limit, not NaN
+        for e in (1e-46, floatmin(Float64) / 4)
+            softmax_cols!(W, C, e)
+            @test W[:, 1] == (1:6 .== argmin(C[:, 1]))
+            softmax_cols!(Wg, view(C, :, :), e)
+            @test Wg[:, 1] == (1:6 .== argmin(C[:, 1]))
+        end
     end
 
     @testset "lse kernels" begin
@@ -64,7 +74,7 @@ ref_lse(x) = (m = maximum(x); m + log(sum(exp.(x .- m))))
     @testset "sanitize_cost!" begin
         C = [1.0 Inf; -2.0 NaN]
         sanitize_cost!(C)
-        @test C == [1.0 1e6; -2.0 1e6]  # 2*2+1=5 < 1e6 floor
+        @test C == [1.0 5.0; -2.0 5.0]  # 2*max|finite|+1, no absolute floor
         C2 = [1e7 -Inf]
         sanitize_cost!(C2)
         @test C2 == [1e7 (2e7 + 1)]
@@ -80,17 +90,22 @@ ref_lse(x) = (m = maximum(x); m + log(sum(exp.(x .- m))))
         # generic method
         C4 = view([1.0 Inf; -2.0 NaN], :, :)
         sanitize_cost!(C4)
-        @test C4 == [1.0 1e6; -2.0 1e6]
+        @test C4 == [1.0 5.0; -2.0 5.0]
     end
 
     @testset "scale_cost!" begin
         C = [1.0 -2.0; 3.0 -4.0]
         Cs = similar(C)
         @test scale_cost!(Cs, C, nothing) == C
+        # :mean/:max recenter by min(C) first
         scale_cost!(Cs, C, :mean)
-        @test isapprox(Cs, C ./ mean(abs, C))
+        @test isapprox(Cs, (C .- minimum(C)) ./ mean(C .- minimum(C)))
         scale_cost!(Cs, C, :max)
-        @test isapprox(Cs, C ./ 4.0)
+        @test isapprox(Cs, (C .- minimum(C)) ./ 7.0)
+        # shift-invariant: f and f + c get the same temperature
+        for spec in (:mean, :max)
+            @test isapprox(scale_cost!(similar(C), C .+ 100, spec), scale_cost!(Cs, C, spec))
+        end
         scale_cost!(Cs, C, 2.0)
         @test isapprox(Cs, C ./ 2.0)
         @test_throws ArgumentError scale_cost!(Cs, C, -1.0)
@@ -102,11 +117,17 @@ ref_lse(x) = (m = maximum(x); m + log(sum(exp.(x .- m))))
         Zs = similar(Z)
         scale_cost!(Zs, Z, :mean)
         @test all(iszero, Zs)
+        # a constant Float16 cost must not give 0/0 (5e-11 rounds to 0 there)
+        @test all(iszero, scale_cost!(similar(Z, Float16), fill(Float16(3), 2, 2), :mean))
         # :mean divisor overflow at extreme costs falls back to the finite max
         Cbig = fill(1e308, 2, 2)
         Csb = similar(Cbig)
         scale_cost!(Csb, Cbig, :mean)
         @test all(isfinite, Csb)
+        # costs spanning +-floatmax: recentering must not overflow to NaN
+        Cpm = [-1e308 1e308; 0.0 0.0]
+        @test scale_cost!(similar(Cpm), Cpm, :mean) == [0.0 1.0; 0.5 0.5]
+        @test scale_cost!(similar(Cpm), Cpm, :max) == [0.0 1.0; 0.5 0.5]
     end
 
     @testset "normalize_particle_masses!" begin

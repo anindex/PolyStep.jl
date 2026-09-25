@@ -1,7 +1,5 @@
-# Steady-state allocation checks on the numeric kernels (using @allocated after
-# warmup, no BenchmarkTools dependency). The solve() wrappers and step!
-# allocate their small outputs by design (plan/duals per solve, negligible
-# next to the objective); the kernels must not.
+# Steady-state allocation checks (@allocated after warmup). solve() and step!
+# allocate small outputs by design; the kernels must not.
 using PolyStep: softmax_cols!, lse_cols!, lse_rows!, sanitize_cost!, scale_cost!,
                  normalize_particle_masses!, _cost_from_losses!, _probe_points_orthoplex!,
                  haar_rotations!, fd_gradient!, fd_hessian_diag!, newton_step!
@@ -52,9 +50,7 @@ using PolyStep: softmax_cols!, lse_cols!, lse_rows!, sanitize_cost!, scale_cost!
     end
     absC = abs.(C)
     @test @allocated(softmax_cols!(W, C, 0.3)) == 0
-    # lse_cols!/lse_rows! dispatch to @turbo kernels when LoopVectorization is loaded;
-    # LV on Julia 1.10 boxes an intermediate (~1.8 kB), eliminated on 1.11+ and on the
-    # base no-LV path. Bound on 1.10, ban elsewhere.
+    # the LV @turbo lse kernels box an intermediate on Julia 1.10, not on 1.11+
     lse_bound = VERSION < v"1.11" ? 2048 : 0
     @test @allocated(lse_cols!(out_p, C, addv)) <= lse_bound
     @test @allocated(lse_rows!(out_v, C, addp, accm, accs)) <= lse_bound
@@ -64,11 +60,9 @@ using PolyStep: softmax_cols!, lse_cols!, lse_rows!, sanitize_cost!, scale_cost!
     @test @allocated(_cost_from_losses!(Cm, losses, K)) == 0
     @test @allocated(fd_gradient!(G, L3, scales, 0.5)) == 0
     @test @allocated(fd_hessian_diag!(H, L3, scales, 0.5)) == 0
-    # only kwarg call here: Julia 1.10 boxes a small keyword NamedTuple (0 B on
-    # 1.11+), so bound rather than require exact zero
+    # Julia 1.10 boxes the keyword NamedTuple (0 B on 1.11+)
     @test @allocated(newton_step!(N, G, H; max_step_norm = 1.0)) <= 512
-    # Polyester @batch kernels: ~240 B/call of task-closure overhead when
-    # nthreads > 1, a per-step constant, not per-element. Bound, don't ban.
+    # Polyester @batch: constant per-call task overhead when nthreads > 1
     @test @allocated(_probe_points_orthoplex!(Xp, X, R, T(0.5), scales)) <= 512
     @test @allocated(haar_rotations!(R, Z, rng)) <= 512
 
@@ -76,11 +70,11 @@ using PolyStep: softmax_cols!, lse_cols!, lse_rows!, sanitize_cost!, scale_cost!
     es = PolyStepES(8; num_particles = 2, rng = Xoshiro(7))
     ask!(es)
     tell!(es, zeros(popsize(es)))
-    @test @allocated(ask!(es)) == 0
+    # Julia 1.10: the cached @batch QR kernel allocates per extra thread
+    @test @allocated(ask!(es)) <= (VERSION < v"1.11" ? 512 : 0)
     tell!(es, zeros(popsize(es)))
 
-    # whole-step budgets (softmax fast path / sinkhorn workspace reuse):
-    # guards against reintroducing per-step (V,P) allocations in the step loop
+    # whole-step budgets: no per-step (V,P) allocations
     fobj(Xm) = vec(sum(abs2, Xm; dims = 1))
     ps_soft = PolyStepConfig(dim = 8)
     st_soft = init_state(ps_soft, randn(rng, 8, 64))
@@ -91,11 +85,14 @@ using PolyStep: softmax_cols!, lse_cols!, lse_rows!, sanitize_cost!, scale_cost!
         PolyStep.step!(fobj, ps_sink, st_sink; rng)
     end
     @test @allocated(PolyStep.step!(fobj, ps_soft, st_soft; rng)) < 32_000
-    @test @allocated(PolyStep.step!(fobj, ps_sink, st_sink; rng)) < 96_000
+    @test @allocated(PolyStep.step!(fobj, ps_sink, st_sink; rng)) < 32_000
+    # Sinkhorn iterations allocate nothing: 1000 fixed iterations stay a small constant
+    s_fx = SinkhornSolver(threshold = 0.0, max_iterations = 1000)
+    C_fx = rand(rng, 16, 8)
+    PolyStep.solve(s_fx, C_fx, 0.1)
+    @test @allocated(PolyStep.solve(s_fx, C_fx, 0.1)) < 4_000
 
-    # quadratic model + Newton refinement + trust region + biased rotation: the
-    # FD/Newton/refinement buffers are preallocated in the state, so the step
-    # does no per-step (d,P) allocations (guards against reintroducing them)
+    # quadratic model + Newton + trust region + biased rotation: no per-step (d,P) allocations
     ps_quad = PolyStepConfig(dim = 8, num_probe = 2, use_quadratic_model = true,
         newton_refinement = true, trust_region = true, biased_rotation = true)
     st_quad = init_state(ps_quad, randn(rng, 8, 64))

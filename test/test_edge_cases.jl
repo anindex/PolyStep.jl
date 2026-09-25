@@ -1,5 +1,4 @@
-# Edge-case and regression tests. Each testset names the defect it pins down;
-# if one fails, the corresponding behavior regressed.
+# Edge-case and regression tests; each testset names the behavior it pins down.
 using PolyStep: _best_finite, solve, SinkhornSolver, KLSoftmaxSolver,
                  TopKMeanSolver, SoftmaxSolver, OTResult, AbstractOTSolver,
                  normalize_particle_masses!, softmax_cols!, newton_refinement!, _diverged
@@ -149,11 +148,19 @@ end
         @test_throws DimensionMismatch PolyStepES(3; lb = [-1.0], ub = [1.0, 1.0, 1.0])
         @test_throws ArgumentError init_state(PolyStepConfig(dim = 3, probe_radius_jitter = 1.0), zeros(3, 2))
         @test_throws ArgumentError init_state(PolyStepConfig(dim = 3, probe_radius_jitter = -0.1), zeros(3, 2))
-        # invalid bounds (lb > ub, non-finite) and ProgressiveEpsilon radii rejected
+        # invalid bounds and ProgressiveEpsilon radii rejected
         @test_throws ArgumentError init_state(PolyStepConfig(dim = 2, lb = [1.0, 1.0], ub = [0.0, 2.0]), zeros(2, 2))
         @test_throws ArgumentError init_state(PolyStepConfig(dim = 2, lb = NaN, ub = 1.0), zeros(2, 2))
         @test_throws ArgumentError PolyStepES(2; lb = [1.0, 1.0], ub = [0.0, 2.0])
-        @test_throws ArgumentError PolyStepES(1; lb = -Inf, ub = 1.0)
+        @test_throws ArgumentError PolyStepES(1; lb = Inf, ub = Inf)
+        @test_throws ArgumentError PolyStepES(1; lb = -Inf, ub = -Inf)
+        # +-Inf half-bounded boxes are fine (bounds are only used through clamp)
+        @test PolyStepES(2; lb = [0.0, -Inf], ub = [Inf, Inf]) isa PolyStepES
+        sq1(X) = vec(sum(abs2, X .+ 1; dims = 1))      # optimum (-1, -1) outside the box
+        psh = PolyStepConfig(dim = 2, lb = [0.0, -Inf], ub = Inf, max_iterations = 30)
+        sth = init_state(psh, ones(2, 3))
+        solve!(sq1, psh, sth; rng = Xoshiro(3))
+        @test all(>=(0), sth.X[1, :]) && sth.best_x[1] >= 0 && isfinite(sth.best_f)
         @test_throws ArgumentError init_state(PolyStepConfig(dim = 2, step_radius = ProgressiveEpsilon()), zeros(2, 2))
         @test_throws ArgumentError init_state(PolyStepConfig(dim = 2, probe_radius = ProgressiveEpsilon()), zeros(2, 2))
         st = init_state(PolyStepConfig(dim = 3, lb = fill(-1.0, 3), ub = fill(1.0, 3),
@@ -189,6 +196,20 @@ end
         for p in 1:6
             @test maximum(abs, st.R[:, :, p]' * st.R[:, :, p] - I(3)) < 1e-5
         end
+    end
+
+    @testset "biased rotation stays per particle when some probes return Inf" begin
+        g = columnwise(x -> x[1] > 1.0 ? Inf : sum(abs2, x .- 0.5))
+        ps = PolyStepConfig(dim = 3, num_probe = 2, use_quadratic_model = true,
+            biased_rotation = true)
+        st = init_state(ps, [-1.0 1.0; 0.0 0.0; 0.0 0.0])   # particle 2 straddles the Inf wall
+        step!(g, ps, st; rng = Xoshiro(1))
+        pd = copy(st.prev_descent)
+        @test all(isfinite, pd[:, 1]) && !all(isfinite, pd[:, 2])
+        step!(g, ps, st; rng = Xoshiro(2))
+        # particle 1 is still biased toward its FD descent; particle 2 keeps a Haar draw
+        @test isapprox(st.R[:, 1, 1], pd[:, 1] ./ norm(pd[:, 1]); atol = 1e-10)
+        @test maximum(abs, st.R[:, :, 2]' * st.R[:, :, 2] - I(3)) < 1e-10
     end
 
     @testset "KLSoftmax(lam=Inf) guards unequal marginal mass" begin
@@ -289,6 +310,18 @@ end
         @test LinearEpsilon(init = 1.0, target = 0.01, decay = 0.01) isa LinearEpsilon
     end
 
+    @testset "CosineEpsilon horizon (ceil) and SGDR period growth" begin
+        # ceil horizon: the default schedule reaches target at t=100, like LinearEpsilon
+        @test epsilon_at(CosineEpsilon(), 99) > 1e-3
+        @test epsilon_at(CosineEpsilon(), 100) == 1e-3
+        # T*mult < T+1 still grows the period (4 -> 5), and restarts never pin to target
+        s = CosineEpsilon(total_steps = 4, restart_mult = 1.2)
+        @test epsilon_at(s, 4) == 1.0 && epsilon_at(s, 9) == 1.0
+        @test epsilon_at(s, 1000) > 0.1
+        # zero decay: the inferred horizon must not overflow Int
+        @test isapprox(epsilon_at(CosineEpsilon(init = 1e7, target = 1.0, decay = 0.0), 5), 1e7)
+    end
+
     @testset "simplex / cube polytope step! path descends" begin
         sq(X) = vec(sum(abs2, X; dims = 1))
         for poly in (:simplex, :cube)
@@ -301,7 +334,7 @@ end
             end
             @test st.dirs !== nothing                     # used the general (matmul) path
             @test all(isfinite, st.X)
-            @test mean(sq(st.X)) < mean(sq(X0))           # descended the sphere
+            @test mean(sq(st.X)) < mean(sq(X0))
         end
     end
 
@@ -368,9 +401,7 @@ end
     end
 
     @testset "Sinkhorn/KL are numerically shift-invariant at extreme cost magnitudes" begin
-        # equal astronomical costs: entropic OT -> independent uniform coupling.
-        # Before per-column centering, -C/eps overflowed to -Inf and the plan
-        # collapsed to all-zero (a no-op hold).
+        # equal astronomical costs: uniform coupling, -C/eps must not overflow to -Inf
         C = fill(1e308, 2, 2)
         sh = solve(SinkhornSolver(max_iterations = 200), C, 1e-6)
         @test all(isfinite, sh.plan)
@@ -390,7 +421,7 @@ end
     end
 
     @testset "ProgressiveEpsilon decreasing setpoint (total_steps > 0)" begin
-        # total_steps = 0: iteration ignored (backward-compatible reactive governor)
+        # total_steps = 0: iteration ignored (reactive governor)
         ep0 = ProgressiveEpsilon(init = 1.0, target = 0.01)
         @test epsilon_at(ep0, 5) == epsilon_at(ep0, 500) == 1.0
         # total_steps > 0: decreasing cosine baseline from init to target
@@ -416,7 +447,7 @@ end
             step!(aniso, ps, st; rng = Xoshiro(8))
         end
         @test all(m -> 0.1 <= m <= 3.0, st.trust_multipliers)
-        @test mean(aniso(st.X)) < mean(aniso(X0))            # descended
+        @test mean(aniso(st.X)) < mean(aniso(X0))
     end
 
     @testset "all-non-finite batch holds the iterate (bounds active)" begin

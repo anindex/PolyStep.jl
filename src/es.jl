@@ -1,6 +1,5 @@
-# PolyStepES: ask/tell interface. ask! returns (dim, popsize) candidate columns;
-# tell! takes their fitness (lower better). Candidates are clamped/repaired before
-# caching, so evaluated and projected points match and the barycenter stays in bounds.
+# PolyStepES ask/tell. Candidates are clamped/repaired before caching, so the
+# evaluated and projected points match and the barycenter stays in bounds.
 
 """
     PolyStepES(dim; num_particles=1, epsilon=0.5, step_radius=0.5,
@@ -14,8 +13,19 @@ to all particles) or a `(dim, num_particles)` matrix. `lb`/`ub` (scalar or
 `(dim,)`) box-clamp candidates; `repair` is an in-place candidate
 post-processor `repair(X_cols)` (e.g. rounding for integrality) applied after
 clamping; it must itself preserve the bounds (its output is not re-clamped).
-`best_x`/`best_f` track the best evaluated candidate, always feasible when
-bounds and a bounds-preserving `repair` are active.
+`best_x`/`best_f` track the best evaluated point: every `tell!` candidate, plus
+the final iterate that `minimize` and `PolyStepOptimizer` score once. They are
+always feasible when bounds and a bounds-preserving `repair` are active.
+
+`step_radius` is absolute: candidates are `X +/- step_radius * R`. (In
+`PolyStepConfig` an unscheduled radius is multiplied by `epsilon`, so pass
+`r / epsilon` or a schedule there for the same step.) The radius is fixed, so
+the mean settles in an O(`step_radius`) neighborhood of a minimizer. To shrink
+it, mutate `es.step_radius` from a callback, e.g.
+`minimize(f, d; callback = es -> (es.step_radius *= 0.99; false))`.
+`:mean` recenters and rescales the costs every round, so near a minimizer the
+iterate keeps moving by a fixed fraction of `step_radius` (set by `epsilon` and
+`dim`, not by the distance to the minimizer).
 """
 mutable struct PolyStepES{
     T <: AbstractFloat, S <: AbstractOTSolver, SC, LB, UB, RP, RNG <: AbstractRNG}
@@ -32,7 +42,6 @@ mutable struct PolyStepES{
     X::Matrix{T}                 # (d, P)
     pending::Union{Nothing, Matrix{T}}   # points at askbuf between ask! and tell!
     const askbuf::Matrix{T}      # (d, popsize) candidates, refilled each ask!
-    const Zc::Array{T, 3}
     const R::Array{T, 3}
     const Wn::Matrix{T}          # (V, P)
     const Cbuf::Matrix{T}        # (V, P) fitness -> cost staging, reused per tell!
@@ -52,6 +61,8 @@ function PolyStepES(dim::Integer; num_particles::Integer = 1, epsilon::Real = 0.
     epsilon > 0 || throw(ArgumentError("epsilon must be > 0, got $epsilon"))
     (isfinite(step_radius) && step_radius >= 0) ||
         throw(ArgumentError("step_radius must be finite and >= 0, got $step_radius"))
+    # reject a bad spec now, not after the first population is evaluated
+    scale_cost === nothing || scale_cost!(zeros(1, 1), zeros(1, 1), scale_cost)
     (lb === nothing) == (ub === nothing) ||
         throw(ArgumentError("provide both lb and ub or neither"))
     lb isa AbstractVector && length(lb) != dim &&
@@ -76,6 +87,8 @@ function PolyStepES(dim::Integer; num_particles::Integer = 1, epsilon::Real = 0.
         X0 = x0 isa AbstractVector ? repeat(reshape(T.(x0), d, 1), 1, P) : Matrix{T}(x0)
         size(X0) == (d, P) ||
             throw(ArgumentError("x0 has size $(size(X0)), expected ($d,) or ($d, $P)"))
+        # one non-finite column would make tell! skip every update
+        all(isfinite, X0) || throw(ArgumentError("x0 must be finite"))
         copy(X0)
     end
     return PolyStepES{T, typeof(solver), typeof(scale_cost), typeof(lb), typeof(ub),
@@ -83,11 +96,16 @@ function PolyStepES(dim::Integer; num_particles::Integer = 1, epsilon::Real = 0.
         d, P, Float64(epsilon), Float64(step_radius), deepcopy(solver), scale_cost,
         lb, ub, repair, rng,
         X, nothing, Matrix{T}(undef, d, 2d * P),
-        zeros(T, d, d, P), zeros(T, d, d, P), zeros(T, 2d, P),
+        zeros(T, d, d, P), zeros(T, 2d, P),
         zeros(T, 2d, P), zeros(T, d, P),
         fill(T(NaN), d), Inf, 0)
 end
 
+"""
+    popsize(es)
+
+Candidates per `ask!`: `num_particles * 2 * dim`.
+"""
 popsize(es::PolyStepES) = es.num_particles * 2 * es.dim
 Statistics.mean(es::PolyStepES) = vec(mean(es.X; dims = 2))
 
@@ -95,15 +113,16 @@ Statistics.mean(es::PolyStepES) = vec(mean(es.X; dims = 2))
     ask!(es) -> (dim, popsize) Matrix
 
 Candidate points as columns (column `v + (p-1)*2dim` = vertex v of particle p).
-Errors when called twice without an intervening `tell!`. Do not mutate the
-returned matrix; evaluate it and pass fitness to `tell!`.
+Errors when called twice without an intervening `tell!`. The returned matrix
+is an internal buffer: do not mutate it (`tell!` reads it back), and `copy` it
+to keep it, since the next `ask!` overwrites it in place.
 """
 function ask!(es::PolyStepES{T}) where {T}
     es.pending === nothing ||
         throw(ErrorException("ask! called twice before tell!; tell! the previous population first"))
     d = es.dim
     P = es.num_particles
-    haar_rotations!(es.R, es.Zc, es.rng)
+    haar_rotations!(es.R, es.R, es.rng)   # R doubles as the Gaussian scratch
     C = es.askbuf                # reused; tell! consumes it before the next ask!
     sr = T(es.step_radius)
     @inbounds for p in 1:P
@@ -139,9 +158,7 @@ function tell!(es::PolyStepES{T}, fitness::AbstractVector) where {T}
     d = es.dim
     P = es.num_particles
     V = 2d
-    # NaN-safe scan up front. If the whole batch is non-finite, hold every
-    # particle: a uniform softmax over clamped/repaired candidates would drift
-    # the iterate on a round with no valid evaluation.
+    # no finite fitness: hold every particle (a uniform softmax would drift)
     fmin, idx = _best_finite(fitness)
     if idx == 0
         es.evals += ps
@@ -154,12 +171,9 @@ function tell!(es::PolyStepES{T}, fitness::AbstractVector) where {T}
     end
     local plan
     if es.solver isa SoftmaxSolver
-        # fast path: sanitize+scale in place on the state buffer; the softmax
-        # weights are the realized-mass-normalized plan (plan = W .* a' and
-        # the normalization divides a' back out), columns carry mass 1 exactly
+        # fast path: softmax weights already equal the mass-normalized plan
         sanitize_cost!(C)
         es.scale_cost === nothing || scale_cost!(C, C, es.scale_cost)
-        _warn_tiny_eps!(es.solver, es.epsilon, C)
         softmax_cols!(es.Wn, C, es.epsilon)
         plan = nothing
     else
@@ -172,8 +186,7 @@ function tell!(es::PolyStepES{T}, fitness::AbstractVector) where {T}
     fill!(X_new, zero(T))
     @inbounds for p in 1:P
         if plan !== nothing
-            # a (near-)zero-mass plan column would "project" onto the origin
-            # (Wn ~ 0); hold that particle's position instead
+            # hold particles whose plan column has (near-)zero mass (Wn ~ 0)
             mass = zero(T)
             for v in 1:V
                 mass += plan[v, p]
@@ -196,7 +209,7 @@ function tell!(es::PolyStepES{T}, fitness::AbstractVector) where {T}
     if all(isfinite, X_new)
         copyto!(es.X, X_new)
     end
-    # incumbent update (idx != 0 guaranteed: the all-non-finite case returned early)
+    # idx != 0: the all-non-finite case returned early
     if fmin < es.best_f
         es.best_f = Float64(fmin)
         copyto!(es.best_x, view(pend, :, idx))
@@ -213,10 +226,13 @@ end
 Optimization.jl algorithm wrapper (activated by loading Optimization /
 OptimizationBase; implemented in the package extension). `maxiters` counts
 ask/tell rounds: total objective evaluations = `maxiters * num_particles *
-2 * dim`. Optimization.jl objectives are scalar-per-point; the adapter loops
-over candidates and warns once; pass `batched = f_batch` through `solve`
-kwargs (or use the native `minimize`/`PolyStepES` API) to keep vectorized
-evaluation.
+2 * dim`, plus `num_particles` to score the final iterate. `maxtime` (seconds)
+is checked after each round; `abstol`/`reltol` are ignored. With neither
+`maxiters` nor `maxtime`, 1000 rounds run. Optimization.jl objectives are
+scalar-per-point; the adapter loops over candidates (reshaped like `u0`) and
+warns once; pass `batched = f_batch` through `solve` kwargs (or use the native
+`minimize`/`PolyStepES` API) to keep vectorized evaluation. `f_batch` takes the
+flat `(length(u0), N)` candidate matrix and returns the N objective values.
 """
 Base.@kwdef struct PolyStepOptimizer{S <: AbstractOTSolver, SC}
     num_particles::Int = 1
@@ -229,9 +245,12 @@ end
 """
     minimize(f, dim; steps=200, callback=nothing, kwargs...) -> PolyStepES
 
-Run `steps` ask/tell rounds of the batched objective
-`f(X::(dim, popsize))::(popsize,)`. `callback(es) -> true` stops early.
-Result in `es.best_x` / `es.best_f` / `mean(es)`.
+Run `steps` ask/tell rounds of the batched objective `f(X::(dim, N))::(N,)`.
+`callback(es) -> true` stops early. The final iterate (clamped and repaired) is
+then scored once as a `(dim, num_particles)` matrix, costing `num_particles`
+extra evaluations, so `best_f` is never worse than `f` at the point the run
+ended on. `f` and `repair` must therefore accept any column count, not just
+`popsize`. Result in `es.best_x` / `es.best_f` / `mean(es)`.
 """
 function minimize(f, dim::Integer; steps::Integer = 200, callback = nothing, kwargs...)
     es = PolyStepES(dim; kwargs...)
@@ -239,6 +258,20 @@ function minimize(f, dim::Integer; steps::Integer = 200, callback = nothing, kwa
         X = ask!(es)
         tell!(es, f(X))
         callback !== nothing && callback(es) === true && break
+    end
+    return _score_iterate!(es, f)
+end
+
+# candidates sit step_radius off the iterate, so score the iterate itself once
+function _score_iterate!(es::PolyStepES, f)
+    Xc = copy(es.X)
+    es.lb === nothing || (Xc .= clamp.(Xc, es.lb, es.ub))
+    es.repair === nothing || es.repair(Xc)   # keeps best_x feasible
+    fc, i = _best_finite(f(Xc))
+    es.evals += size(Xc, 2)
+    if i != 0 && fc < es.best_f
+        es.best_f = fc
+        copyto!(es.best_x, view(Xc, :, i))
     end
     return es
 end

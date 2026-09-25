@@ -1,17 +1,6 @@
-# CUDA extension. v1 scope (see README):
-#   1. `cuda_objective`: adapt a GPU batched objective to the CPU-side step loop
-#      (one H2D upload of the candidate matrix, one D2H download of the losses
-#      per call). The objective dominates PolyStep's cost, so this is
-#      where the GPU pays off at OR problem scales.
-#   2. CUBLAS strided-batched methods for the per-particle rotation products
-#      (stride-0 broadcast of the shared right factor; the high-level
-#      batched_mul! rejects 2D x 3D).
-# The numeric kernels (softmax, sanitize, mass-normalize) have AbstractMatrix
-# broadcast fallbacks that run on CuArray and are covered by the GPU tests.
-# SinkhornSolver/KLSoftmaxSolver.solve use scalar-indexed convergence and repair
-# loops and stay CPU-side; a GPU objective reaches OT through the softmax path.
-# A fully device-resident PolyStepState is deferred until profiles show the
-# CPU-side kernels (us at V = 2d <= 16) actually bound a workload.
+# CUDA extension: `cuda_objective` (one upload/download per call) and CUBLAS
+# strided-batched rotation products. Other kernels run on CuArray through the
+# broadcast fallbacks; Sinkhorn/KL solvers use scalar indexing and stay on CPU.
 module PolyStepCUDAExt
 
 using PolyStep
@@ -31,8 +20,8 @@ function PolyStep.cuda_objective(f_gpu; T::Type{<:AbstractFloat} = Float32)
     end
 end
 
-# Y[:,:,p] = A[:,:,p] * B: the shared B enters as a size-1 batch, which the
-# CUBLAS wrapper broadcasts with stride 0 (one kernel for all particles)
+# Y[:,:,p] = A[:,:,p] * B: shared B as a size-1 batch, broadcast with stride 0
+# (batched_mul! rejects 2D x 3D)
 function PolyStep._batched_mul!(
         Y::CuArray{T, 3}, A::CuArray{T, 3}, B::CuMatrix{T}) where {T <: Union{Float32, Float64}}
     d, V, _ = size(Y)

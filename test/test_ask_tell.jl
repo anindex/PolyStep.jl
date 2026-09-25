@@ -16,10 +16,19 @@ sphere_b(X) = vec(sum(abs2, X; dims = 1))
         @test_throws ArgumentError PolyStepES(3; step_radius = Inf)
         @test_throws ArgumentError PolyStepES(3; x0 = zeros(2))
         @test_throws ArgumentError PolyStepES(3; lb = 0.0)
+        # non-finite x0 would freeze every particle
+        @test_throws ArgumentError PolyStepES(2; x0 = [0.0, NaN])
+        @test_throws ArgumentError PolyStepES(2; num_particles = 2, x0 = [0.0 Inf; 0.0 0.0])
+        # scale_cost spec checked at construction, before any evaluation
+        @test_throws ArgumentError PolyStepES(3; scale_cost = :meen)
+        @test_throws ArgumentError PolyStepES(3; scale_cost = -1.0)
+        @test_throws ArgumentError PolyStepES(3; scale_cost = 0.0)
+        @test PolyStepES(3; scale_cost = :max_cost) isa PolyStepES
+        @test PolyStepES(3; scale_cost = 2.0) isa PolyStepES
+        @test PolyStepES(3; scale_cost = nothing) isa PolyStepES
         # x0 vector broadcasts to all particles
         es2 = PolyStepES(3; num_particles = 4, x0 = [1.0, 2.0, 3.0])
         @test es2.X == repeat([1.0 2.0 3.0]', 1, 4)
-        # x0 matrix taken as-is
         X0 = randn(Xoshiro(1), 3, 2)
         es3 = PolyStepES(3; num_particles = 2, x0 = X0)
         @test es3.X == X0
@@ -51,8 +60,8 @@ sphere_b(X) = vec(sum(abs2, X; dims = 1))
 
             plus = X[:, (p - 1) * 2d + i]
             minus = X[:, (p - 1) * 2d + d + i]
-            @test isapprox((plus .+ minus) ./ 2, es.X[:, p]; atol = 1e-12)  # antithetic
-            @test isapprox(norm(plus .- es.X[:, p]), 0.7; atol = 1e-10)  # at step radius
+            @test isapprox((plus .+ minus) ./ 2, es.X[:, p]; atol = 1e-12)
+            @test isapprox(norm(plus .- es.X[:, p]), 0.7; atol = 1e-10)
         end
     end
 
@@ -69,6 +78,32 @@ sphere_b(X) = vec(sum(abs2, X; dims = 1))
         tell!(es, fill(NaN, popsize(es)))
         @test es.X == Xheld
         @test es.best_f == minimum(fit)          # NaN never becomes the incumbent
+    end
+
+    @testset "ask! reuses its buffer; R doubles as rotation scratch" begin
+        es = PolyStepES(3; rng = Xoshiro(6))
+        A1 = ask!(es)
+        tell!(es, sphere_b(A1))
+        @test ask!(es) === A1
+        for d in (5, 12)                          # static and LAPACK rotation paths
+            es = PolyStepES(d; num_particles = 3, rng = Xoshiro(5))
+            ask!(es)
+            @test haar_rotations!(zeros(d, d, 3), zeros(d, d, 3), Xoshiro(5)) == es.R
+        end
+    end
+
+    @testset "minimize scores the final iterate" begin
+        # zero steps: only x0 is scored, so best_f is f(x0)
+        es0 = minimize(sphere_b, 3; steps = 0, x0 = fill(2.0, 3))
+        @test es0.best_f == 12.0 && es0.best_x == fill(2.0, 3) && es0.evals == 1
+        # best_f includes the scored final iterate
+        es = minimize(sphere_b, 10; steps = 300, x0 = fill(0.5, 10), rng = Xoshiro(0))
+        @test es.best_f <= sphere_b(es.X)[1]
+        @test es.evals == 300 * popsize(es) + 1
+        # the scored iterate is repaired first, so best_x stays integral
+        rnd(X) = (X .= round.(X); X)
+        esr = minimize(sphere_b, 3; steps = 0, repair = rnd, x0 = fill(0.4, 3))
+        @test esr.best_x == zeros(3) && esr.best_f == 0.0
     end
 
     @testset "seeded determinism" begin
@@ -117,7 +152,7 @@ sphere_b(X) = vec(sum(abs2, X; dims = 1))
             rng = Xoshiro(31))
         for _ in 1:5
             X = ask!(es)
-            @test all(x -> lo <= x <= hi, X)      # candidates clamped
+            @test all(x -> lo <= x <= hi, X)
             tell!(es, sphere_b(X))
             @test all(x -> lo <= x <= hi, es.X)   # barycenter of box points stays in box
         end

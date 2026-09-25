@@ -1,30 +1,7 @@
-# Log-domain Sinkhorn solver. Layout (V, P): f-update reduces over vertices
-# (contiguous columns, lse_cols!); g-update reduces over particles (streaming
-# accumulators, lse_rows!), so one layout serves both directions with no transpose.
+# Log-domain Sinkhorn. Layout (V, P): the f-update reduces contiguous columns
+# (lse_cols!), the g-update streams over particles (lse_rows!), no transpose.
 
-"""
-    SinkhornSolver(; max_iterations=2000, threshold=1e-6, check_every=10,
-                   omega=1.0, anderson_depth=0, adaptive_omega=false,
-                   data_dependent_init=false)
-
-Entropic OT: `min_P <C,P> + eps*KL(P || a(x)b)` s.t. `P1=a, P'1=b, P>=0`,
-solved by log-domain alternating (Gauss-Seidel) dual updates with optional
-successive overrelaxation `omega in [0.5, 1.95]`, warm-started duals,
-Anderson acceleration (Tikhonov-regularized, accepted only when it improves the
-Lyapunov dual), the Lehmann residual-ratio adaptive omega, and a latched
-divergence detector for `omega > 1.5`. `threshold <= 0` selects fixed-iteration
-mode (single terminal finite check; a finite result reports `converged=true`,
-which ProgressiveEpsilon needs).
-
-Solver instances hold per-call scratch (workspace, warn latches) and are
-single-run-per-instance: never share one across concurrent optimizations.
-
-The `solve` body uses scalar-indexed convergence and plan-repair loops, so it is
-a CPU path (not safe under `CUDA.allowscalar(false)`). GPU objectives reach OT
-through the softmax kernels and `cuda_objective`, not through `SinkhornSolver`.
-"""
-# per-solver scratch reused across solve calls (solvers are single-run-per-
-# instance); rebuilt whenever the cost matrix's eltype or shape changes
+# scratch reused across solve calls; rebuilt when eltype or shape changes
 mutable struct SinkhornWorkspace{T}
     Cs::Matrix{T}
     logK::Matrix{T}
@@ -46,6 +23,28 @@ function SinkhornWorkspace{T}(V::Int, P::Int) where {T}
         Vector{T}(undef, V), Vector{T}(undef, V))
 end
 
+"""
+    SinkhornSolver(; max_iterations=2000, threshold=1e-6, check_every=10,
+                   omega=1.0, anderson_depth=0, adaptive_omega=false,
+                   data_dependent_init=false)
+
+Entropic OT: `min_P <C,P> + eps*KL(P || a(x)b)` s.t. `P1=a, P'1=b, P>=0`,
+solved by log-domain alternating (Gauss-Seidel) dual updates with optional
+successive overrelaxation `omega in [0.5, 1.95]`, warm-started duals,
+Anderson acceleration (Tikhonov-regularized, accepted only when it improves the
+Lyapunov dual), the Lehmann residual-ratio adaptive omega (estimated only while
+omega == 1, as in Python), and a latched divergence detector for `omega > 1.5`.
+`threshold <= 0` selects fixed-iteration mode (single terminal finite check; a
+finite result reports `converged=true`, which ProgressiveEpsilon needs).
+`ent_cost` is the dual value in the caller's (sanitized, scaled) cost frame.
+
+Solver instances hold per-call scratch (workspace, warn latches) and are
+single-run-per-instance: never share one across concurrent optimizations.
+
+The `solve` body uses scalar-indexed convergence and plan-repair loops, so it is
+a CPU path (not safe under `CUDA.allowscalar(false)`). GPU objectives reach OT
+through the softmax kernels and `cuda_objective`, not through `SinkhornSolver`.
+"""
 Base.@kwdef mutable struct SinkhornSolver <: AbstractOTSolver
     max_iterations::Int = 2000
     threshold::Float64 = 1e-6
@@ -84,9 +83,8 @@ function _align_dual(init, n::Integer, ::Type{T}, name::String) where {T}
     return convert(Vector{T}, collect(init))
 end
 
-# D(f,g) = <f,a> + <g,b> - eps * sum(P): the true Sinkhorn Lyapunov, valid off
-# the marginal constraint (used as the Anderson accept gate). `tmpP` (length P)
-# and `gdiv` (length V) are scratch, fully overwritten here.
+# Lyapunov D(f,g) = <f,a> + <g,b> - eps*sum(P), valid off the marginal constraint
+# (Anderson accept gate). tmpP (P) and gdiv (V) are overwritten scratch.
 function _dual_objective(f::Vector{T}, g::Vector{T}, logK::Matrix{T}, am, bm, epsT::T,
         tmpP::Vector{T}, gdiv::Vector{T}) where {T}
     @. gdiv = g / epsT
@@ -101,20 +99,29 @@ function _dual_objective(f::Vector{T}, g::Vector{T}, logK::Matrix{T}, am, bm, ep
     return dot(f, am) + dot(g, bm) - epsT * mass
 end
 
+# one SOR sweep (f then g); top-level since a closure would box the buffers
+function _sor_iterate!(f, g, omegaT, epsT, logK, log_a, log_b,
+        ftmp, gtmp, fdiv, gdiv, accm, accs)
+    gdiv .= g ./ epsT
+    lse_cols!(ftmp, logK, gdiv)
+    @. f = (1 - omegaT) * f + omegaT * epsT * (log_a - ftmp)
+    fdiv .= f ./ epsT
+    lse_rows!(gtmp, logK, fdiv, accm, accs)
+    @. g = (1 - omegaT) * g + omegaT * epsT * (log_b - gtmp)
+    return nothing
+end
+
 function solve(s::SinkhornSolver, C::AbstractMatrix{T}, eps::Real;
         a = nothing, b = nothing, f0 = nothing, g0 = nothing,
         scale_cost = nothing, last_eps = nothing) where {T}
     T <: AbstractFloat || return solve(s, float.(C), eps; a, b, f0, g0, scale_cost, last_eps)
     _check_eps(eps)
-    # the log-domain kernel Cs/(-eps) is undefined at eps=Inf (softmax handles Inf
-    # via max-subtraction, but the iterative dual loop cannot)
     isfinite(eps) ||
         throw(ArgumentError("Sinkhorn requires a finite epsilon, got $eps (the log-domain dual iteration is undefined at infinite temperature)"))
     V, P = size(C)
     (V == 0 || P == 0) &&
         throw(ArgumentError("Sinkhorn received an empty cost matrix (V=$V, P=$P)"))
-    # workspace reuse for the CPU path; GPU/generic arrays keep the
-    # allocating broadcast path
+    # CPU path reuses the workspace; generic/GPU arrays allocate
     ws = C isa Matrix{T} ? _sinkhorn_ws(s, T, V, P) : nothing
     Cs = if ws === nothing
         _prepare_cost(C, scale_cost)
@@ -124,14 +131,12 @@ function solve(s::SinkhornSolver, C::AbstractMatrix{T}, eps::Real;
         scale_cost === nothing || scale_cost!(ws.Cs, ws.Cs, scale_cost)
         ws.Cs
     end
-    # per-column shift invariance: anchors the cheapest vertex of -Cs/eps at 0, so
-    # the log-domain iteration and plan stay finite even at extreme cost magnitudes
-    # (softmax already does the equivalent). The plan is invariant to this shift.
-    center_cols!(Cs)
     am = _align_marginal(a, P, Cs, "a")
+    shift = dot(am, vec(minimum(Cs; dims = 1)))   # added back to ent_cost
+    # per-column centering (plan-invariant) keeps -Cs/eps finite at extreme costs
+    center_cols!(Cs)
     bm = _align_marginal(b, V, Cs, "b")
-    # two-sided OT is infeasible for mismatched total mass: threshold mode can
-    # never converge and fixed mode would still report success
+    # unequal masses are infeasible (fixed mode would still report success)
     tot_a, tot_b = sum(am), sum(bm)
     abs(tot_a - tot_b) <= sqrt(Base.eps(T)) * max(tot_a, tot_b) ||
         throw(ArgumentError("Sinkhorn marginals must have equal total mass; got sum(a)=$tot_a, sum(b)=$tot_b"))
@@ -158,13 +163,12 @@ function solve(s::SinkhornSolver, C::AbstractMatrix{T}, eps::Real;
     else
         fa = _align_dual(f0, P, T, "f0")
         ga = _align_dual(g0, V, T, "g0")
-        # allocate on the same array backend as Cs (matters for GPU/generic C)
+        # same array backend as Cs
         f = fa === nothing ? fill!(similar(Cs, T, P), zero(T)) : fa
         g = ga === nothing ? fill!(similar(Cs, T, V), zero(T)) : ga
     end
 
-    # rescale warm-started duals when eps changed, holding u = f/eps roughly fixed
-    # (runs before the clamp below so a big ratio stays bounded)
+    # rescale warm starts by the eps ratio (u = f/eps held fixed), before the clamp
     if last_eps !== nothing && last_eps > 0 && (f0 !== nothing || g0 !== nothing)
         if abs(last_eps - eps) / max(eps, 1e-9) > 1e-6
             sc = T(eps / last_eps)
@@ -173,7 +177,7 @@ function solve(s::SinkhornSolver, C::AbstractMatrix{T}, eps::Real;
         end
     end
 
-    # clamp warm-started duals to the cost magnitude, a safety net at convergence
+    # clamp warm starts to the cost magnitude
     cost_scale = max(maximum(abs, Cs), T(1e-6))
     mad = 10 * cost_scale
     if !(all(isfinite, f) && all(isfinite, g))
@@ -184,8 +188,8 @@ function solve(s::SinkhornSolver, C::AbstractMatrix{T}, eps::Real;
         clamp!(g, -mad, mad)
     end
 
-    # gauge re-center f -> f+c, g -> g-c (leaves f_i+g_j and the plan intact;
-    # independent mean subtraction is not a valid gauge under omega != 1)
+    # gauge shift f+c, g-c keeps the plan; separate mean subtraction is not a
+    # valid gauge under omega != 1
     c = T(0.5) * (mean(g) - mean(f))
     f .+= c
     g .-= c
@@ -204,11 +208,9 @@ function solve(s::SinkhornSolver, C::AbstractMatrix{T}, eps::Real;
     omega = s.omega
     omegaT = T(omega)
 
-    # reusable buffers (every use fully overwrites before reading)
+    # scratch: every use overwrites before reading, so undef is safe
     local ftmp, gtmp, fdiv, gdiv, accm, accs
     if ws === nothing
-        # same array backend as Cs (GPU/generic path); every use overwrites
-        # before reading, so uninitialized scratch is safe
         ftmp = similar(Cs, T, P)
         gtmp = similar(Cs, T, V)
         fdiv = similar(Cs, T, P)
@@ -224,23 +226,13 @@ function solve(s::SinkhornSolver, C::AbstractMatrix{T}, eps::Real;
         accs = ws.accs
     end
 
-    @inline function sor_iterate!(f, g, omegaT)
-        gdiv .= g ./ epsT
-        lse_cols!(ftmp, logK, gdiv)
-        @. f = (1 - omegaT) * f + omegaT * epsT * (log_a - ftmp)
-        fdiv .= f ./ epsT
-        lse_rows!(gtmp, logK, fdiv, accm, accs)
-        @. g = (1 - omegaT) * g + omegaT * epsT * (log_b - gtmp)
-        return nothing
-    end
-
     if fixed_mode
         for i in 1:(s.max_iterations)
-            sor_iterate!(f, g, omegaT)
+            _sor_iterate!(f, g, omegaT, epsT, logK, log_a, log_b,
+                ftmp, gtmp, fdiv, gdiv, accm, accs)
             n_iters = i
         end
-        # fixed mode: a finite result is success (converged=false would make
-        # ProgressiveEpsilon inflate epsilon)
+        # finite means success (else ProgressiveEpsilon inflates epsilon)
         if !(all(isfinite, f) && all(isfinite, g))
             fill!(f, zero(T))
             fill!(g, zero(T))
@@ -256,9 +248,7 @@ function solve(s::SinkhornSolver, C::AbstractMatrix{T}, eps::Real;
         div_patience = 3
         omega_capped = false
 
-        # the Anderson branch allocates per acceleration step; it runs only when
-        # anderson_depth > 0 (0 by default). Move its buffers into the workspace if
-        # it ever shows in a profile.
+        # the Anderson branch allocates per step (only when anderson_depth > 0)
         for i in 1:(s.max_iterations)
             use_anderson = s.anderson_depth > 0 && i % s.check_every == 0
             local f_old, g_old
@@ -266,7 +256,8 @@ function solve(s::SinkhornSolver, C::AbstractMatrix{T}, eps::Real;
                 f_old = copy(f)
                 g_old = copy(g)
             end
-            sor_iterate!(f, g, omegaT)
+            _sor_iterate!(f, g, omegaT, epsT, logK, log_a, log_b,
+                ftmp, gtmp, fdiv, gdiv, accm, accs)
 
             if use_anderson
                 r_f = f .- f_old
@@ -301,7 +292,8 @@ function solve(s::SinkhornSolver, C::AbstractMatrix{T}, eps::Real;
                             delta_x[1:P, j] .= aa_x[j + 1][1] .- aa_x[j][1]
                             delta_x[(P + 1):end, j] .= aa_x[j + 1][2] .- aa_x[j][2]
                         end
-                        combined = vcat(f, g) .- delta_x * alpha
+                        # type-II Anderson: G(x) - dG*alpha with dG = dX + dR
+                        combined = vcat(f, g) .- (delta_x .+ delta_r) * alpha
                         if all(isfinite, combined)
                             f_c = combined[1:P]
                             g_c = combined[(P + 1):end]
@@ -310,9 +302,8 @@ function solve(s::SinkhornSolver, C::AbstractMatrix{T}, eps::Real;
                             lyap_plain = _dual_objective(f, g, logK, am, bm, epsT, ftmp, gdiv)
                             lyap_comb = _dual_objective(
                                 f_c, g_c, logK, am, bm, epsT, ftmp, gdiv)
-                            # accept only if it beats the plain step and does not
-                            # regress vs the previous iterate; the fallback keeps
-                            # the plain step, so a rejection never corrupts f/g
+                            # accept only if not worse than the plain step and
+                            # the previous iterate; else keep the plain step
                             if lyap_comb >= lyap_plain - 1e-6 && lyap_comb >= lyap_prev - 1e-6
                                 f = f_c
                                 g = g_c
@@ -323,7 +314,8 @@ function solve(s::SinkhornSolver, C::AbstractMatrix{T}, eps::Real;
             end
             n_iters = i
 
-            if i % s.check_every == 0
+            # always check the last iteration, or a converged solve reports false
+            if i % s.check_every == 0 || i == s.max_iterations
                 if !(all(isfinite, f) && all(isfinite, g))
                     fill!(f, zero(T))
                     fill!(g, zero(T))
@@ -342,10 +334,9 @@ function solve(s::SinkhornSolver, C::AbstractMatrix{T}, eps::Real;
                     marg_b_err = max(marg_b_err, abs(exp_fast(g[v] / epsT + gtmp[v]) - bm[v]))
                 end
                 err = Float64(max(marg_a_err, marg_b_err))
+                omega_old = omega
 
-                # static-omega divergence detector (only monitored at the
-                # high-omega end; 3 consecutive >5% dual-norm growths back
-                # omega off to 1.0 and latch it)
+                # divergence detector: repeated dual-norm growth latches omega to 1
                 if omega > 1.5
                     dual_norm = Float64(maximum(abs, f) + maximum(abs, g))
                     if dual_norm > div_prev_norm * 1.05
@@ -365,21 +356,20 @@ function solve(s::SinkhornSolver, C::AbstractMatrix{T}, eps::Real;
                     div_prev_norm = dual_norm
                 end
 
-                # Lehmann residual-ratio adaptive omega, valid only for a contracting
-                # residual: err >= prev_err would map a divergence to the largest omega,
-                # so back off toward the Gauss-Seidel end (omega = 1) instead.
-                if s.adaptive_omega && !omega_capped
-                    if !isnan(prev_err) && prev_err > 1e-12 && err > 0
-                        if err < prev_err
-                            r = min(err / prev_err, 0.99)
-                            omega = 2.0 / (1.0 + sqrt(1.0 - r^(1.0 / s.check_every)))
-                            omega = clamp(omega, 1.0, 1.95)
-                        else
-                            omega = max(1.0, 1.0 + (omega - 1.0) * 0.5)
-                        end
+                # Lehmann adaptive omega: estimate the rate only while omega == 1;
+                # relaxed or Anderson-jumped residuals give a wrong rate
+                if s.adaptive_omega && !omega_capped && omega == 1.0
+                    if !isnan(prev_err) && prev_err > 1e-12 && 0 < err < prev_err
+                        r = min(err / prev_err, 0.99)
+                        omega = clamp(2.0 / (1.0 + sqrt(1.0 - r^(1.0 / s.check_every))), 1.0, 1.95)
                         omegaT = T(omega)
                     end
                     prev_err = err
+                end
+                # Anderson history holds residuals of the old map: restart it
+                if omega != omega_old
+                    empty!(aa_x)
+                    empty!(aa_r)
                 end
 
                 push!(errors, err)
@@ -391,21 +381,12 @@ function solve(s::SinkhornSolver, C::AbstractMatrix{T}, eps::Real;
         end
     end
 
-    # threshold mode with max_iterations < check_every runs no periodic finiteness
-    # check, so a cost overflow could leave NaN duals here. Zero them: the per-column
-    # repair below turns the plan into a no-op and callers still get finite duals.
-    if !(all(isfinite, f) && all(isfinite, g))
-        fill!(f, zero(T))
-        fill!(g, zero(T))
-    end
-
-    ent_reg_cost = Float64(dot(f, am) + dot(g, bm) - epsT * sum(am))
-    # logK is dead past the loop. Reuse it as the log-plan scratch
+    ent_reg_cost = Float64(dot(f, am) + dot(g, bm) - epsT * sum(am) + shift)
+    # logK is dead past the loop; reuse it as log-plan scratch
     logP = ws === nothing ? ((f' .+ g .- Cs) ./ epsT) : (@. ws.logK = (f' + g - Cs) / epsT)
     plan = exp.(logP)
-    # unconverged/overrelaxed exits can push a column's exponents past exp's range
-    # (Inf, or an all-zero underflow that would no-op the step). Repair only broken
-    # columns with a per-column max shift; healthy columns keep their values.
+    # columns past exp's range (Inf, or all-zero underflow) get a per-column max
+    # shift; healthy columns are untouched
     @inbounds for p in 1:P
         colfinite = true
         colmass = zero(T)
@@ -421,8 +402,7 @@ function solve(s::SinkhornSolver, C::AbstractMatrix{T}, eps::Real;
                     plan[v, p] = exp_fast(logP[v, p] - m)
                 end
             else
-                # all -Inf (empty) or NaN duals: zero the column. The caller's
-                # realized-mass floor turns it into a per-particle no-op step
+                # all -Inf or NaN: zero column, a no-op step via the mass floor
                 for v in 1:V
                     plan[v, p] = zero(T)
                 end

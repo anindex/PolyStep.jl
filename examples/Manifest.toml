@@ -2,7 +2,7 @@
 
 julia_version = "1.12.6"
 manifest_format = "2.0"
-project_hash = "7c24b8b6a08a888035adc7ae6f6ef46774a8e0f3"
+project_hash = "5478b934a823ceeb24316e855666254ba5e4e02e"
 
 [[deps.ADTypes]]
 git-tree-sha1 = "ec6be48a85c93d995563b84bff8a86bc98df45ce"
@@ -1081,22 +1081,6 @@ git-tree-sha1 = "7204148362dafe5fe6a273f855b8ccbe4df8173e"
 uuid = "692b3bcd-3c85-4b1f-b108-f13ce0eb3210"
 version = "1.8.0"
 
-[[deps.PolyStep]]
-deps = ["LinearAlgebra", "Polyester", "Random", "SLEEFPirates", "StaticArrays", "Statistics"]
-path = ".."
-uuid = "1d716556-7f39-4cf5-924f-ba9c6bc0b019"
-version = "0.1.2"
-
-    [deps.PolyStep.extensions]
-    PolyStepCUDAExt = "CUDA"
-    PolyStepLoopVectorizationExt = "LoopVectorization"
-    PolyStepOptimizationExt = "OptimizationBase"
-
-    [deps.PolyStep.weakdeps]
-    CUDA = "052768ef-5323-5732-b1bb-66c8b64840ba"
-    LoopVectorization = "bdcacae8-1622-11e9-2a5c-532679323890"
-    OptimizationBase = "bca83a33-5cc9-4baa-983d-23429ab6bcbb"
-
 [[deps.JSON]]
 deps = ["Dates", "Logging", "Parsers", "PrecompileTools", "StructUtils", "UUIDs", "Unicode"]
 git-tree-sha1 = "3e846e18560a65dcef26febd2ede0160c6831c1c"
@@ -1714,6 +1698,22 @@ deps = ["Pkg"]
 git-tree-sha1 = "f9501cc0430a26bc3d156ae1b5b0c1b47af4d6da"
 uuid = "eebad327-c553-4316-9ea0-9fa01ccd7688"
 version = "0.3.3"
+
+[[deps.PolyStep]]
+deps = ["LinearAlgebra", "Polyester", "PrecompileTools", "Random", "SLEEFPirates", "StaticArrays", "Statistics"]
+path = ".."
+uuid = "1d716556-7f39-4cf5-924f-ba9c6bc0b019"
+version = "0.2.0"
+
+    [deps.PolyStep.extensions]
+    PolyStepCUDAExt = "CUDA"
+    PolyStepLoopVectorizationExt = "LoopVectorization"
+    PolyStepOptimizationExt = "OptimizationBase"
+
+    [deps.PolyStep.weakdeps]
+    CUDA = "052768ef-5323-5732-b1bb-66c8b64840ba"
+    LoopVectorization = "bdcacae8-1622-11e9-2a5c-532679323890"
+    OptimizationBase = "bca83a33-5cc9-4baa-983d-23429ab6bcbb"
 
 [[deps.Polyester]]
 deps = ["ArrayInterface", "BitTwiddlingConvenienceFunctions", "CPUSummary", "IfElse", "ManualMemory", "PolyesterWeave", "Static", "StaticArrayInterface", "StrideArraysCore", "ThreadingUtilities"]

@@ -3,59 +3,64 @@ on:
   push:
     branches: [main]
     tags: ['*']
+    paths-ignore: ['**.md', 'docs/**', 'CITATION.cff', 'LICENSE']
   pull_request:
+    paths-ignore: ['**.md', 'docs/**', 'CITATION.cff', 'LICENSE']
+  workflow_dispatch:
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+permissions:
+  actions: write
+  contents: read
 jobs:
   test:
     name: Julia ${{ matrix.version }} - ${{ matrix.mode }}
     runs-on: ubuntu-latest
+    timeout-minutes: 45
     continue-on-error: ${{ matrix.version == 'nightly' }}
+    env:
+      JULIA_NUM_THREADS: ${{ matrix.version == 'nightly' && '1' || '2' }}
     strategy:
       fail-fast: false
       matrix:
-        version: ['1.10', '1', 'nightly']   # LTS, latest stable, nightly
-        mode: [with-lv, without-lv]
+        include:
+          - version: 'min'
+            mode: with-lv
+          - version: '1'
+            mode: with-lv
+          - version: '1'
+            mode: without-lv
+          - version: 'nightly'
+            mode: with-lv
     steps:
-      - uses: actions/checkout@v4
-      - uses: julia-actions/setup-julia@v2
+      - uses: actions/checkout@v7
+      - uses: julia-actions/setup-julia@v3
         with:
           version: ${{ matrix.version }}
-      - uses: julia-actions/cache@v2
+      - uses: julia-actions/cache@v3
       - name: Strip LoopVectorization from the test target
         if: matrix.mode == 'without-lv'
-        # exercise the weakdep-absent path (the extension never loads)
+        shell: bash
         run: |
           julia -e '
             using TOML
             t = TOML.parsefile("Project.toml")
             delete!(t["extras"], "LoopVectorization")
             t["targets"]["test"] = filter(!=("LoopVectorization"), t["targets"]["test"])
-            open("Project.toml", "w") do io
-                TOML.print(io, t)
-            end'
-        shell: bash
+            open(io -> TOML.print(io, t), "Project.toml", "w")'
       - uses: julia-actions/julia-buildpkg@v1
       - uses: julia-actions/julia-runtest@v1
+        with:
+          coverage: ${{ matrix.version == '1' && matrix.mode == 'with-lv' }}
+      - name: Example smoke test
+        if: matrix.version == '1' && matrix.mode == 'without-lv'
+        run: julia --project=. examples/01_hard_decision_tree.jl
       - uses: julia-actions/julia-processcoverage@v1
         if: matrix.version == '1' && matrix.mode == 'with-lv'
-      - uses: codecov/codecov-action@v5
+      - uses: codecov/codecov-action@v7
         if: matrix.version == '1' && matrix.mode == 'with-lv'
         with:
           files: lcov.info
           token: ${{ secrets.CODECOV_TOKEN }}
           fail_ci_if_error: false
-  example:
-    name: Example smoke test
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: julia-actions/setup-julia@v2
-        with:
-          version: '1'
-      - uses: julia-actions/cache@v2
-      - uses: julia-actions/julia-buildpkg@v1
-      # example 01 uses only PolyStep + stdlib, so it runs on the package project
-      # without instantiating the heavy examples environment; it self-asserts a gate
-      - run: julia --project=. examples/01_hard_decision_tree.jl

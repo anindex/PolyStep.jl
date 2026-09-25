@@ -84,6 +84,11 @@ function polytope_vertices(polytope::Symbol, dim::Integer; kwargs...)
     polytope_vertices(Float64, polytope, dim; kwargs...)
 end
 
+"""
+    num_vertices(polytope, dim)
+
+Vertex count: `2dim` (`:orthoplex`), `dim + 1` (`:simplex`), `2^dim` (`:cube`).
+"""
 function num_vertices(polytope::Symbol, dim::Integer)
     polytope === :orthoplex ? 2dim :
     polytope === :simplex ? dim + 1 :
@@ -103,21 +108,19 @@ probe_scales(::Type{T}, K::Integer) where {T} = collect(T, range(0, 1; length = 
 # Rotations
 # ---------------------------------------------------------------------------
 
-# The d>8 LAPACK paths pin BLAS to one thread (threaded outer loop + threaded
-# BLAS oversubscribes); the pin mutates process-global state, so concurrent
-# callers serialize on this lock to avoid restoring a stale thread count.
+# BLAS pinning is global state; the lock stops callers restoring a stale count
 const _BLAS_PIN_LOCK = ReentrantLock()
 
-# Mezzadri phase: sign of the R-diagonal with sign(0) := +1, so an underflowed
-# zero diagonal can't null a column (geometry.py:209-213).
+# Mezzadri phase with sign(0) := +1, so an underflowed zero diagonal can't null a column
 @inline _mezzadri_phase(r::T) where {T} = ifelse(r < zero(T), -one(T), one(T))
 
 """
     haar_rotations!(R, Z, rng) -> R
 
 Fill `R::(d,d,P)` with Haar-uniform SO(d) rotations. `Z::(d,d,P)` is Gaussian
-scratch. The Gaussian fill is serial from one rng (bit-identical for any thread
-count); the per-slice QR is threaded (deterministic given Z).
+scratch and may alias `R` (each slice is read fully before it is written). The
+Gaussian fill is serial from one rng (bit-identical for any thread count); the
+per-slice QR may run threaded (deterministic given Z).
 
 d=2: analytic rotation from theta ~ U[0,2 * pi) (matches geometry.py:173-176; consumes
 one uniform per particle, no QR). d>2: QR + Mezzadri sign fix + det=+1 flip of
@@ -156,18 +159,22 @@ function _qr_slices!(R::Array{T, 3}, Z::Array{T, 3}) where {T}
     return R
 end
 
-function _qr_slices_static!(R::Array{T, 3}, Z::Array{T, 3}, ::Val{D}) where {T, D}
-    P = size(R, 3)
-    @batch for p in 1:P
-        Zp = SMatrix{D, D, T}(@view Z[:, :, p])
-        Q, Rf = _haar_q(Zp)
-        @inbounds for j in 1:D, i in 1:D
-            R[i, j, p] = Q[i, j]
-        end
-        # Rf is unused past _haar_q; kept in the signature so the sign fix is
-        # testable in isolation.
+function _qr_slices_static!(R::Array{T, 3}, Z::Array{T, 3}, v::Val{D}) where {T, D}
+    # no batch-size gate: threading pays off already at small P
+    @batch for p in 1:size(R, 3)
+        _haar_slice!(R, Z, p, v)
     end
     return R
+end
+
+@inline function _haar_slice!(
+        R::AbstractArray{T, 3}, Z::AbstractArray{T, 3}, p::Int, ::Val{D}) where {T, D}
+    # _haar_q also returns Rf so tests can check the sign fix
+    Q, _ = _haar_q(SMatrix{D, D, T}(@view Z[:, :, p]))
+    @inbounds for j in 1:D, i in 1:D
+        R[i, j, p] = Q[i, j]
+    end
+    return nothing
 end
 
 @inline function _haar_q(Zp::SMatrix{D, D, T}) where {D, T}
@@ -175,7 +182,9 @@ end
     Rf = F.R
     phases = SVector(ntuple(i -> _mezzadri_phase(Rf[i, i]), Val(D)))
     Q = F.Q * Diagonal(phases)
-    if det(Q) < zero(T)
+    # det parity without LU: StaticArrays applies a reflection (det -1) iff Rf[k,k] != 0
+    nrefl = count(k -> !iszero(Rf[k, k]), 1:(D - 1))
+    if isodd(nrefl + count(<(zero(T)), phases))
         Q = _flipcol(Q, Val(1))
     end
     return Q, Rf
@@ -189,60 +198,89 @@ end
         end, Val(D * D)))
 end
 
-function _qr_slices_lapack!(R::Array{T, 3}, Z::Array{T, 3}) where {T}
-    d = size(R, 1)
-    P = size(R, 3)
+# f(p) per slice with BLAS pinned to one thread (bits independent of BLAS threads);
+# the slice loop threads only from d = 256, below that serial is faster
+function _foreach_slice_pinned(f::F, d::Int, P::Int) where {F}
     lock(_BLAS_PIN_LOCK)
     nb = BLAS.get_num_threads()
     BLAS.set_num_threads(1)
     try
-        # Not :static, the static scheduler throws when nested inside user
-        # threading (e.g. @threads over seeds); slices are independent, so the
-        # dynamic scheduler keeps results bit-identical for any thread count
-        Threads.@threads for p in 1:P
-            A = @view Z[:, :, p]
-            F = qr!(A)
-            # capture the Mezzadri signs from diag(R) (upper triangle of A) before
-            # materializing Q. Matrix(F.Q) leaves A intact today, but reading the
-            # signs first keeps the phase fix correct if Q is ever formed in place.
-            phases = [_mezzadri_phase(A[j, j]) for j in 1:d]
-            Qm = Matrix(F.Q)
-            @inbounds for j in 1:d
-                ph = phases[j]
-                @simd ivdep for i in 1:d
-                    Qm[i, j] *= ph
-                end
+        if Threads.nthreads() > 1 && P > 1 && d >= 256
+            # not :static (throws when nested); independent slices stay bit-identical
+            Threads.@threads for p in 1:P
+                f(p)
             end
-            if det(Qm) < zero(T)
-                @inbounds @simd ivdep for i in 1:d
-                    Qm[i, 1] = -Qm[i, 1]
-                end
+        else
+            for p in 1:P
+                f(p)
             end
-            copyto!(view(R, :, :, p), Qm)
         end
     finally
         BLAS.set_num_threads(nb)
         unlock(_BLAS_PIN_LOCK)
     end
+    return nothing
+end
+
+# In-place Householder QR in LAPACK layout; tau[j] == 0 means reflector j is the identity.
+# Generic methods cover BigFloat/Float16 (Julia's QR stores (factors, tau)).
+_geqrf!(A::StridedMatrix{T}, tau) where {T <: LinearAlgebra.BlasReal} = LAPACK.geqrf!(A, tau)
+_geqrf!(A, tau) = copyto!(tau, getfield(qr!(A), 2))
+_orgqr!(A::StridedMatrix{T}, tau) where {T <: LinearAlgebra.BlasReal} = LAPACK.orgqr!(A, tau)
+_orgqr!(A, tau) = copyto!(A, Matrix(LinearAlgebra.QRPackedQ(A, tau)))
+
+# Factored A -> Q * Diagonal(sign(diag(R))), negating column `flip` for det = +1.
+# det(Q) = (-1)^count(tau .!= 0): O(d), no LU det underflow at large d.
+function _phase_fixed_q!(A::AbstractMatrix{T}, tau, ph, flip::Int) where {T}
+    d = size(A, 1)
+    n = 0
+    @inbounds for j in 1:d
+        ph[j] = _mezzadri_phase(A[j, j])
+        n += (ph[j] < zero(T)) + !iszero(tau[j])
+    end
+    if isodd(n)
+        ph[flip] = -ph[flip]
+    end
+    _orgqr!(A, tau)
+    @inbounds for j in 1:d
+        s = ph[j]
+        @simd ivdep for i in 1:d
+            A[i, j] *= s
+        end
+    end
+    return A
+end
+
+function _qr_slices_lapack!(R::Array{T, 3}, Z::Array{T, 3}) where {T}
+    d = size(R, 1)
+    P = size(R, 3)
+    tau = Matrix{T}(undef, d, P)
+    ph = Matrix{T}(undef, d, P)
+    _foreach_slice_pinned(d, P) do p
+        A = view(R, :, :, p)
+        Z === R || copyto!(A, view(Z, :, :, p))
+        _geqrf!(A, view(tau, :, p))
+        _phase_fixed_q!(A, view(tau, :, p), view(ph, :, p), 1)
+    end
     return R
-    # qr!/Matrix(Q) allocate per slice; use FastLapackInterface if the
-    # d>8 path ever shows in profiles (d<=8 is the designed regime).
 end
 
 """
     biased_rotation!(R, bias) -> R
 
 Bias column 1 of each rotation toward the unit direction `bias[:, p]` and
-re-orthonormalize (exact port of geometry.py:226-256): plain QR (no Mezzadri
-phases here), non-finite Q falls back to the input rotation, then (applied to
-the output regardless of fallback) column-1 sign realign against the bias
-(`dot < 0` -> flip; 0 -> keep) and a det=+1 fix flipping the **last** column.
-`bias` columns must be unit vectors (caller normalizes with a 1e-10 floor).
+re-orthonormalize by QR with Mezzadri phases, which equals the Gram-Schmidt of
+geometry.py `apply_biased_rotation`: column 1 is the bias itself and columns
+2..d are uniform on its complement. Non-finite input keeps the input
+rotation; a det=+1 fix flips the **last** column. d=1 returns `R` unchanged
+(SO(1) = {1}). `bias` columns must be unit vectors (caller normalizes with a
+1e-10 floor).
 """
 function biased_rotation!(R::Array{T, 3}, bias::AbstractMatrix{T}) where {T <: AbstractFloat}
     d = size(R, 1)
     P = size(R, 3)
     size(bias) == (d, P) || throw(DimensionMismatch("bias must be (d,P)"))
+    d == 1 && return R
     if d <= 8
         _biased_rotation_static!(R, bias, Val(d))
     else
@@ -251,32 +289,31 @@ function biased_rotation!(R::Array{T, 3}, bias::AbstractMatrix{T}) where {T <: A
     return R
 end
 
-function _biased_rotation_static!(R::Array{T, 3}, bias::AbstractMatrix{T}, ::Val{D}) where {T, D}
-    P = size(R, 3)
-    @batch for p in 1:P
-        b = SVector{D, T}(@view bias[:, p])
-        # a unit bias has ||b||=1; ||b||~0 means the descent was below the caller's
-        # normalization floor (e.g. flat objective); keep the fresh Haar
-        # rotation instead of biasing toward a degenerate direction
-        dot(b, b) < T(0.25) && continue
-        Rp = SMatrix{D, D, T}(@view R[:, :, p])
-        M = hcat(b, _dropcol1(Rp))
-        F = qr(M)
-        Q = SMatrix{D, D, T}(F.Q)
-        out = all(isfinite, Q) ? Q : Rp
-        # QR fixes column 1 only up to sign; realign toward descent (0 -> keep)
-        dot0 = dot(out[:, 1], b)
-        if dot0 < zero(T)
-            out = _flipcol(out, Val(1))
-        end
-        if det(out) < zero(T)
-            out = _flipcol(out, Val(D))
-        end
-        @inbounds for j in 1:D, i in 1:D
-            R[i, j, p] = out[i, j]
-        end
+function _biased_rotation_static!(R::Array{T, 3}, bias::AbstractMatrix{T}, v::Val{D}) where {T, D}
+    @batch for p in 1:size(R, 3)
+        _biased_slice!(R, bias, p, v)
     end
     return R
+end
+
+@inline function _biased_slice!(
+        R::AbstractArray{T, 3}, bias::AbstractMatrix{T}, p::Int, v::Val{D}) where {T, D}
+    b = SVector{D, T}(@view bias[:, p])
+    # ||b|| ~ 0: descent below the caller's normalization floor; keep the Haar rotation
+    dot(b, b) < T(0.25) && return nothing
+    Rp = SMatrix{D, D, T}(@view R[:, :, p])
+    F = qr(hcat(b, _dropcol1(Rp)))
+    # phases make column 1 = +b and remove the Householder sign bias on columns 2..D
+    phases = SVector(ntuple(i -> _mezzadri_phase(F.R[i, i]), Val(D)))
+    Q = F.Q * Diagonal(phases)
+    all(isfinite, Q) || return nothing
+    if det(Q) < zero(T)
+        Q = _flipcol(Q, v)
+    end
+    @inbounds for j in 1:D, i in 1:D
+        R[i, j, p] = Q[i, j]
+    end
+    return nothing
 end
 
 @inline function _dropcol1(Rp::SMatrix{D, D, T}) where {D, T}
@@ -290,47 +327,18 @@ end
 function _biased_rotation_lapack!(R::Array{T, 3}, bias::AbstractMatrix{T}) where {T}
     d = size(R, 1)
     P = size(R, 3)
-    lock(_BLAS_PIN_LOCK)
-    nb = BLAS.get_num_threads()
-    BLAS.set_num_threads(1)
-    try
-        Threads.@threads for p in 1:P
-            bnorm2 = zero(T)
-            @inbounds @simd for i in 1:d
-                bnorm2 += bias[i, p]^2
-            end
-            # ||b||~0: descent below the caller's floor; keep the fresh Haar rotation
-            bnorm2 < T(0.25) && continue
-            Rp = @view R[:, :, p]
-            M = Matrix{T}(undef, d, d)
-            copyto!(M, Rp)
-            @inbounds for i in 1:d
-                M[i, 1] = bias[i, p]
-            end
-            F = qr!(M)
-            Qm = Matrix(F.Q)
-            if !all(isfinite, Qm)
-                copyto!(Qm, Rp)
-            end
-            dot0 = zero(T)
-            @inbounds @simd for i in 1:d
-                dot0 += Qm[i, 1] * bias[i, p]
-            end
-            if dot0 < zero(T)
-                @inbounds @simd ivdep for i in 1:d
-                    Qm[i, 1] = -Qm[i, 1]
-                end
-            end
-            if det(Qm) < zero(T)
-                @inbounds @simd ivdep for i in 1:d
-                    Qm[i, d] = -Qm[i, d]
-                end
-            end
-            copyto!(Rp, Qm)
-        end
-    finally
-        BLAS.set_num_threads(nb)
-        unlock(_BLAS_PIN_LOCK)
+    tau = Matrix{T}(undef, d, P)
+    ph = Matrix{T}(undef, d, P)
+    _foreach_slice_pinned(d, P) do p
+        b = view(bias, :, p)
+        A = view(R, :, :, p)
+        # ||b|| ~ 0 or non-finite input: keep the Haar rotation (screened before
+        # the QR overwrites A; finite input gives a finite Q)
+        (sum(abs2, b) < T(0.25) || !all(isfinite, b) ||
+         !all(isfinite, view(A, :, 2:d))) && return
+        copyto!(view(A, :, 1), b)
+        _geqrf!(A, view(tau, :, p))
+        _phase_fixed_q!(A, view(tau, :, p), view(ph, :, p), d)
     end
     return R
 end

@@ -1,12 +1,7 @@
-# Optional @turbo accelerations. LoopVectorization on Julia 1.12 is fragile
-# (issue #540): multi-inner-loop @turbo bodies miscompile here, so this
-# extension only provides kernels with the classic
-# single-reduction-per-outer-iteration shape, each verified against the
-# baseline in the test suite. The softmax stays on the SLEEFPirates baseline,
-# already SIMD at ~1 ns/element.
-# Loading this extension (having LoopVectorization anywhere in the active
-# manifest) switches the whole session to the turbo kernels; set
-# PolyStep._TURBO_ACTIVE[] = false to disable it at runtime.
+# Optional @turbo kernels. On Julia 1.12, multi-inner-loop @turbo bodies miscompile
+# (LoopVectorization #540), so only single-reduction shapes are used, each tested
+# against the baseline. Loading LV switches the session to these kernels; set
+# PolyStep._TURBO_ACTIVE[] = false to disable.
 module PolyStepLoopVectorizationExt
 
 using PolyStep

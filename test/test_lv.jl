@@ -22,7 +22,6 @@ using PolyStep: _TURBO_ACTIVE, _lse_cols_base!, _lse_rows_base!, lse_cols!, lse_
         lse_rows!(r2, A, addp, zeros(V), zeros(V))
         @test isapprox(r1, r2; rtol = 1e-12)
     end
-    # Float32 too
     A32 = randn(Xoshiro(7), Float32, 8, 21)
     o1 = zeros(Float32, 21)
     o2 = zeros(Float32, 21)
