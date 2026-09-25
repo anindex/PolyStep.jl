@@ -1,24 +1,34 @@
-# (s, S) inventory policy by simulation optimization, the classic OR testbed
-# (Fu & Healy-style periodic review). Costs: fixed order K=100, unit c=1,
-# holding h=1, backorder p=100; Poisson(20) demand; T=100 periods, R=100
-# replications. Integer demand makes the cost surface piecewise-constant in
-# the policy; Nelder-Mead style simplex methods sit on plateaus while
-# PolyStep's finite-radius probes step across them.
+# (s, S) inventory policy by simulation optimization (Fu and Healy style
+# periodic review): K=100, c=1, h=1, p=100, Poisson(20) demand, zero lead time,
+# T=100 periods, R=100 replications. Common random numbers: optimized on a train
+# demand stream, reported on train and a held-out test stream. Integer demand
+# makes the cost piecewise constant in s, so the best integer policy on the
+# train stream is an exact reference and gaps are >= 0.
 #
-# Common random numbers done properly: one demand tensor per stream, shared by
-# every candidate and every method (paired comparisons); optimized on the
-# train stream, reported on train and a held-out test stream.
+# Compared: PolyStep, IPOP-CMA-ES, SPSA, Nelder-Mead (Optim.jl), all from
+# x0 = (30, 30) in [0, 150]^2, seeds 1:5. Budgets: 500 and 20000 evaluations.
+#
+# Tuning: 9 configs per method and budget, best mean train cost on seeds 101:105
+# (picks at 500 | 20000):
+#   PolyStep     radius {5,20,60} x epsilon {0.05,0.2,0.5}  -> 20, 0.05 | 5, 0.05
+#   IPOP-CMA-ES  sigma0 {1,2,5,10,15,20,30,45,60}           -> 30 | 15
+#   SPSA         a {100,300,1000} x c {2,5,10}               -> 100, 5 | 1000, 2
+#   Nelder-Mead  step {1,2,5,10,15,20,30,45,60}              -> 60 | 60
+# First steps of 5 or less stall near x0, where the policy orders every period.
+#
+# Result: PolyStep, IPOP-CMA-ES and Nelder-Mead tie at the grid optimum at both
+# budgets; SPSA ties at 20000 but trails at 500.
 #
 # Run:  julia --project=examples examples/02_inventory_sS.jl
-#       ECHELONS=5 julia --project=examples ...   # 5-echelon serial system (10-dim)
+#       ECHELONS=5 julia --project=examples ...   # 10-dim serial system, untuned, no reference
 
 using PolyStep
 using Random
 using Statistics
 using Printf
 using Distributions
-using CMAEvolutionStrategy: minimize as cma_minimize, xbest, fbest
 using Optim
+include("ipop_cma.jl")
 
 const K_ORDER = 100.0
 const C_UNIT = 1.0
@@ -26,15 +36,22 @@ const H_HOLD = 1.0
 const P_BACK = 100.0
 const T_PERIODS = 100
 const R_REPS = 100
-const BUDGET = 20_000
+const SEEDS = 1:5
+const BOX = (0.0, 150.0)
 const ECHELONS = parse(Int, get(ENV, "ECHELONS", "1"))
+
+# selected configs per budget (see header)
+const CONFIGS = Dict(
+    500 => (ps = (radius = 20.0, epsilon = 0.05), cma = 30.0,
+        spsa = (a = 100.0, c = 5.0), nm = 60.0),
+    20_000 => (ps = (radius = 5.0, epsilon = 0.05), cma = 15.0,
+        spsa = (a = 1000.0, c = 2.0), nm = 60.0),
+)
 
 demand_tensor(seed) = rand(Xoshiro(seed), Poisson(20), T_PERIODS, R_REPS)
 
-# Serial system: echelon 1 faces customer demand; echelon j > 1 faces the
-# orders of echelon j-1; the top echelon draws from an infinite source.
-# Zero lead time, order-up-to (s_j, S_j) at every echelon; backorder cost only
-# at echelon 1, holding cost everywhere.
+# Serial system: echelon j > 1 faces the orders of echelon j-1, the top one
+# draws from an infinite source. Backorder cost only at echelon 1.
 function sim_cost(x::AbstractVector, D::Matrix{Int})
     n = ECHELONS
     s = ntuple(j -> x[2j - 1], n)
@@ -68,87 +85,106 @@ function sim_cost(x::AbstractVector, D::Matrix{Int})
     return total / R_REPS
 end
 
-batched(D) = X -> [sim_cost(view(X, :, j), D) for j in 1:size(X, 2)]
+boxed(D) = x -> sim_cost(clamp.(x, BOX...), D)
 
 function grid_optimum(D)                 # exact reference on the train stream (1 echelon)
     best = (Inf, 0, 0)
     for s in 0:60, S in s:120
-
         c = sim_cost([float(s), float(S)], D)
         c < best[1] && (best = (c, s, S))
     end
     return best
 end
 
+# Each runner returns (policy, train cost, evals used).
+
+function run_polystep(D, x0, seed, budget; radius, epsilon)
+    dim = length(x0)
+    f = X -> [sim_cost(view(X, :, j), D) for j in 1:size(X, 2)]
+    steps = div(budget - 1, 2dim)       # 2*dim evals per step, one to score the final iterate
+    shrink = 1e-3^(1 / steps)           # radius shrinks geometrically to radius/1000
+    es = minimize(f, dim; steps = steps, epsilon = epsilon, step_radius = radius,
+        x0 = x0, lb = BOX[1], ub = BOX[2], rng = Xoshiro(seed),
+        callback = es -> (es.step_radius *= shrink; false))
+    return es.best_x, es.best_f, es.evals
+end
+
+function run_cma(D, x0, seed, budget; s0)
+    dim = length(x0)
+    x, fx, ev = ipop_cma(boxed(D), x0, s0, budget; seed = seed,
+        lower = fill(BOX[1], dim), upper = fill(BOX[2], dim))
+    return clamp.(x, BOX...), fx, ev
+end
+
+# SPSA with Spall's gains; returns the best evaluated point
+function run_spsa(D, x0, seed, budget; a, c)
+    f = boxed(D)
+    dim = length(x0)
+    rng = Xoshiro(seed)
+    iters = div(budget - 1, 2)
+    A = 0.1 * iters
+    theta = copy(x0)
+    bestx, bestf = copy(x0), Inf
+    for k in 0:(iters - 1)
+        ck = c / (k + 1)^0.101
+        delta = float.(rand(rng, (-1, 1), dim))
+        xp = clamp.(theta .+ ck .* delta, BOX...)
+        xm = clamp.(theta .- ck .* delta, BOX...)
+        fp, fm = f(xp), f(xm)
+        fp < bestf && ((bestf, bestx) = (fp, xp))
+        fm < bestf && ((bestf, bestx) = (fm, xm))
+        theta .-= a / (k + 1 + A)^0.602 .* (fp - fm) ./ (2ck .* delta)
+        clamp!(theta, BOX...)
+    end
+    ftheta = f(theta)
+    ftheta < bestf && ((bestf, bestx) = (ftheta, copy(theta)))
+    return bestx, bestf, 2iters + 1
+end
+
+# initial simplex x0 + step * e_j, stops at its own tolerance
+function run_nm(D, x0, seed, budget; step)
+    nm = NelderMead(initial_simplex = Optim.AffineSimplexer(step, 0.0))
+    o = Optim.optimize(boxed(D), x0, nm, Optim.Options(f_calls_limit = budget, iterations = 10^6))
+    return clamp.(Optim.minimizer(o), BOX...), Optim.minimum(o), Optim.f_calls(o)
+end
+
 function main()
     dim = 2 * ECHELONS
     Dtrain = demand_tensor(42)
     Dtest = demand_tensor(43)
-    ftrain = batched(Dtrain)
     x0 = fill(30.0, dim)
-    box = (0.0, 150.0)
-    rows = Vector{Tuple{String, Vector{Float64}, Float64, Float64}}()
-
-    # PolyStep (budget = rounds * popsize)
-    es = minimize(ftrain, dim; steps = BUDGET ÷ (2dim), epsilon = 0.05,
-        step_radius = 40.0, x0 = x0, lb = box[1], ub = box[2],
-        rng = Xoshiro(0))
-    push!(rows, ("PolyStep", es.best_x, es.best_f, sim_cost(es.best_x, Dtest)))
-
-    # CMA-ES under the same budget/box/objective (BlackBoxOptim.jl is broken on
-    # Julia 1.12, every method dies on the removed Base.warn, so the
-    # registered baselines are CMA-ES + Nelder-Mead, plus an inline SPSA)
-    res = cma_minimize(x -> sim_cost(clamp.(x, box[1], box[2]), Dtrain), x0, 20.0;
-        lower = fill(box[1], dim), upper = fill(box[2], dim),
-        maxfevals = BUDGET, verbosity = 0, seed = UInt(1))
-    xc = clamp.(xbest(res), box[1], box[2])
-    push!(rows, ("CMA-ES", xc, fbest(res), sim_cost(xc, Dtest)))
-
-    # inline SPSA (Spall 1992), 2 evals per iteration
-    let θ = copy(x0), rng = Xoshiro(2), bestf = Inf, bestx = copy(x0)
-        for k in 0:(BUDGET ÷ 2 - 1)
-            ck = 2.0 / (k + 1)^0.101
-            Δ = float.(rand(rng, (-1, 1), dim))
-            fp = sim_cost(clamp.(θ .+ ck .* Δ, box[1], box[2]), Dtrain)
-            fm = sim_cost(clamp.(θ .- ck .* Δ, box[1], box[2]), Dtrain)
-            fmin = min(fp, fm)
-            if fmin < bestf
-                bestf = fmin
-                bestx = clamp.(fp < fm ? θ .+ ck .* Δ : θ .- ck .* Δ, box[1], box[2])
-            end
-            ak = 2.0 / (k + 11)^0.602
-            θ .-= ak .* (fp - fm) ./ (2ck .* Δ)
-            clamp!(θ, box[1], box[2])
-        end
-        push!(rows, ("SPSA", bestx, bestf, sim_cost(bestx, Dtest)))
-    end
-
-    # Nelder-Mead (Optim.jl), same eval budget via f_calls_limit
-    onm = Optim.optimize(x -> sim_cost(clamp.(x, box[1], box[2]), Dtrain), x0,
-        NelderMead(), Optim.Options(f_calls_limit = BUDGET, iterations = 10^6))
-    xnm = clamp.(Optim.minimizer(onm), box[1], box[2])
-    push!(rows, ("Nelder-Mead", xnm, Optim.minimum(onm), sim_cost(xnm, Dtest)))
+    names = ("PolyStep", "IPOP-CMA-ES", "SPSA", "Nelder-Mead")
+    gopt, gs, gS = ECHELONS == 1 ? grid_optimum(Dtrain) : (NaN, 0, 0)
 
     println("(s,S) inventory simulation optimization, $(ECHELONS) echelon(s), dim=$dim")
-    @printf("  budget=%d evals x %d replications, CRN train/test streams\n", BUDGET, R_REPS)
+    @printf("  %d replications per eval, CRN train/test streams, seeds %s\n", R_REPS, SEEDS)
+    ECHELONS == 1 && @printf("  integer-grid optimum: train %.4f at (s=%d, S=%d), test %.4f\n",
+        gopt, gs, gS, sim_cost([float(gs), float(gS)], Dtest))
+    @printf("  %-12s %7s %6s %10s %10s %10s %10s\n", "method", "budget", "evals", "train",
+        "test", "gap% mean", "gap% max")
+    println("  " * "-"^71)
+    psgap = 0.0
+    for budget in sort(collect(keys(CONFIGS)))
+        cfg = CONFIGS[budget]
+        runs = (
+            s -> run_polystep(Dtrain, x0, s, budget; cfg.ps...),
+            s -> run_cma(Dtrain, x0, s, budget; s0 = cfg.cma),
+            s -> run_spsa(Dtrain, x0, s, budget; cfg.spsa...),
+            s -> run_nm(Dtrain, x0, s, budget; step = cfg.nm),     # deterministic
+        )
+        for (name, run) in zip(names, runs)
+            rs = [run(s) for s in SEEDS]
+            train = [r[2] for r in rs]
+            test = [sim_cost(r[1], Dtest) for r in rs]
+            g = max.(100 .* (train .- gopt) ./ gopt, 0.0)          # clip float roundoff
+            name == "PolyStep" && (psgap = max(psgap, maximum(g)))
+            @printf("  %-12s %7d %6d %10.4f %10.4f %10.4f %10.4f\n", name, budget,
+                maximum(r[3] for r in rs), mean(train), mean(test), mean(g), maximum(g))
+        end
+    end
     if ECHELONS == 1
-        gopt, gs, gS = grid_optimum(Dtrain)
-        @printf("  integer-grid optimum (train): %.2f at (s=%d, S=%d)\n", gopt, gs, gS)
-        @printf("  %-14s %-22s %12s %12s %9s\n", "method", "policy", "train", "test", "gap%")
-        println("  " * "-"^72)
-        for (name, x, tr, te) in rows
-            pol = "(" * join([@sprintf("%.1f", v) for v in x], ", ") * ")"
-            @printf("  %-14s %-22s %12.2f %12.2f %8.2f%%\n", name, pol, tr, te,
-                100 * (tr - gopt) / gopt)
-        end
-        ps_gap = 100 * (rows[1][3] - gopt) / gopt
-        @assert ps_gap < 2.0 "PolyStep train gap $(ps_gap)% above 2% of grid optimum"
-        println("  Gate passed: PolyStep within 2% of the grid optimum")
-    else
-        @printf("  %-14s %12s %12s\n", "method", "train", "test")
-        for (name, _, tr, te) in rows
-            @printf("  %-14s %12.2f %12.2f\n", name, tr, te)
-        end
+        @assert psgap < 0.01 "PolyStep train gap $(psgap)% above 0.01%"
+        println("  Gate passed: PolyStep within 0.01% of the grid optimum on every run")
     end
 end
 
