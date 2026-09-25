@@ -3,13 +3,26 @@ on:
   issue_comment:
     types: [created]
   workflow_dispatch:
+permissions:
+  actions: read
+  checks: read
+  contents: write
+  deployments: read
+  issues: read
+  discussions: read
+  packages: read
+  pages: read
+  pull-requests: read
+  repository-projects: read
+  security-events: read
+  statuses: read
 jobs:
   TagBot:
     if: github.event_name == 'workflow_dispatch' || github.actor == 'JuliaTagBot'
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - uses: JuliaRegistries/TagBot@v1
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
-          # a deploy key, so the tag push triggers the docs build for /stable
           ssh: ${{ secrets.DOCUMENTER_KEY }}
