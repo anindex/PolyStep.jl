@@ -10,7 +10,7 @@ makedocs(;
         "Home" => "index.md",
         "API" => "api.md",
     ],
-    checkdocs = :none,
+    checkdocs = :exports,
 )
 
 deploydocs(; repo = "github.com/anindex/PolyStep.jl.git", push_preview = true)

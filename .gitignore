@@ -4,3 +4,5 @@
 # the examples/ Manifest is committed: PolyStep is dev'd by relative path
 # there, so a fresh clone can instantiate and run the examples
 lcov.info
+/docs/Manifest.toml
+/docs/build/

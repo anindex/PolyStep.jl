@@ -2,8 +2,8 @@ cff-version: 1.2.0
 message: "If you use this software, please cite it as below."
 title: "PolyStep.jl: gradient-free polytope direct search for piecewise-constant objectives"
 type: software
-version: "0.1.0"
-date-released: "2026-07-19"
+version: "0.2.0"
+date-released: "2026-09-25"
 authors:
   - family-names: "Le"
     given-names: "An T."
@@ -19,6 +19,15 @@ keywords:
   - simulation-optimization
   - decision-focused-learning
   - julia
+preferred-citation:
+  type: article
+  title: "Training Non-Differentiable Networks via Optimal Transport"
+  authors:
+    - family-names: "Le"
+      given-names: "An T."
+  journal: "Transactions on Machine Learning Research"
+  year: 2026
+  url: "https://arxiv.org/abs/2605.01928"
 references:
   - type: article
     title: "Accelerating Motion Planning via Optimal Transport"
@@ -36,10 +45,3 @@ references:
       name: "Advances in Neural Information Processing Systems (NeurIPS)"
     url: "https://arxiv.org/abs/2309.15970"
     notes: "Origin of the Sinkhorn Step mechanism that PolyStep generalizes."
-  - type: article
-    title: "PolyStep: gradient-free direct search for piecewise-constant objectives"
-    year: 2026
-    url: "https://arxiv.org/abs/2605.01928"
-    authors:
-      - family-names: "Le"
-        given-names: "An T."

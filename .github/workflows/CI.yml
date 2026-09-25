@@ -12,6 +12,8 @@ jobs:
     name: Julia ${{ matrix.version }} - ${{ matrix.mode }}
     runs-on: ubuntu-latest
     continue-on-error: ${{ matrix.version == 'nightly' }}
+    env:
+      JULIA_NUM_THREADS: 2   # run the Polyester/@threads paths multithreaded
     strategy:
       fail-fast: false
       matrix:
