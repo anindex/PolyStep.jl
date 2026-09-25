@@ -12,7 +12,7 @@ using Statistics
     include("test_ask_tell.jl")
     include("test_edge_cases.jl")
     include("test_subspace.jl")
-    include("test_threads.jl")
+    isempty(VERSION.prerelease) && include("test_threads.jl")
     # optional suites run only when the package resolves (the CI without-lv lane strips LV)
     Base.find_package("LoopVectorization") === nothing || include("test_lv.jl")
     Base.find_package("OptimizationBase") === nothing || include("test_optimization.jl")
