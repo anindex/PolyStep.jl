@@ -13,8 +13,6 @@ jobs:
     runs-on: ubuntu-latest
     continue-on-error: ${{ matrix.version == 'nightly' }}
     env:
-      # multithreaded Polyester paths; nightly stays at 1 thread because
-      # ThreadingUtilities segfaults launching threads there
       JULIA_NUM_THREADS: ${{ matrix.version == 'nightly' && '1' || '2' }}
     strategy:
       fail-fast: false
