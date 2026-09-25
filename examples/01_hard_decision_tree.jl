@@ -12,7 +12,7 @@
 #   SPSA         a {10,30,100,300} x c {0.1,0.3,1,3}                       -> 30, 0.3
 #   IPOP-CMA-ES  sigma0, 16 log-spaced values in [0.1, 10]                 -> 10 (edge; up to 100 no better)
 #
-# Result (train/test medians): PolyStep 94.9/89.8%, IPOP-CMA-ES 87.7/83.3%,
+# Result (train/test medians): PolyStep 94.2/90.9%, IPOP-CMA-ES 87.7/83.3%,
 # OpenAI-ES 85.4/80.8%, SPSA 84.6/80.4%.
 #
 # Run:  julia --project=examples examples/01_hard_decision_tree.jl

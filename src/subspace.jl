@@ -244,7 +244,6 @@ function reconstruct_batch(s::HybridSubspace{T}, base::AbstractVector,
         throw(DimensionMismatch("base has length $(length(base)), expected $(s.total_params)"))
     size(Z, 1) == s.subspace_dim ||
         throw(DimensionMismatch("Z has $(size(Z, 1)) rows, expected $(s.subspace_dim)"))
-    # one GEMM per layer; convert Z once so mixed eltypes stay on BLAS
     Zt = eltype(Z) === T ? Z : T.(Z)
     out = Matrix{T}(undef, s.total_params, size(Z, 2))
     @inbounds for k in eachindex(s.specs)

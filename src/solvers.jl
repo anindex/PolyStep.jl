@@ -1,6 +1,3 @@
-# OT weighting solvers. cost/plan are (V, P), f has length P, g has length V.
-# epsilon is a `solve` argument, not solver state.
-
 abstract type AbstractOTSolver end
 
 """
@@ -41,7 +38,6 @@ function _align_marginal(a, n::Integer, C::AbstractMatrix{T}, name::String) wher
     return out
 end
 
-# fresh working copy (caller's C is never mutated); scale_cost! is alias-safe
 function _prepare_cost(C::AbstractMatrix{T}, scale_cost) where {T}
     Cs = similar(C)
     copyto!(Cs, C)
@@ -71,10 +67,6 @@ function _warn_nonuniform_b(b, V::Integer)
     return nothing
 end
 
-# ---------------------------------------------------------------------------
-# SoftmaxSolver (default)
-# ---------------------------------------------------------------------------
-
 """
     SoftmaxSolver()
 
@@ -85,8 +77,8 @@ struct SoftmaxSolver <: AbstractOTSolver end
 
 function solve(s::SoftmaxSolver, C::AbstractMatrix{T}, eps::Real;
         a = nothing, b = nothing, f0 = nothing, g0 = nothing,
-        scale_cost = nothing, last_eps = nothing) where {T}
-    T <: AbstractFloat || return solve(s, float.(C), eps; a, b, f0, g0, scale_cost, last_eps)
+        scale_cost = nothing) where {T}
+    T <: AbstractFloat || return solve(s, float.(C), eps; a, b, f0, g0, scale_cost)
     _check_eps(eps)
     V, P = size(C)
     _check_nonempty(V, P)
@@ -100,10 +92,6 @@ function solve(s::SoftmaxSolver, C::AbstractMatrix{T}, eps::Real;
     return OTResult(plan, ent, nothing, nothing, true, 1)
 end
 
-# ---------------------------------------------------------------------------
-# TemperedSoftmaxSolver
-# ---------------------------------------------------------------------------
-
 """
     TemperedSoftmaxSolver(; tau=1.0)
 
@@ -116,8 +104,8 @@ end
 
 function solve(s::TemperedSoftmaxSolver, C::AbstractMatrix{T}, eps::Real;
         a = nothing, b = nothing, f0 = nothing, g0 = nothing,
-        scale_cost = nothing, last_eps = nothing) where {T}
-    T <: AbstractFloat || return solve(s, float.(C), eps; a, b, f0, g0, scale_cost, last_eps)
+        scale_cost = nothing) where {T}
+    T <: AbstractFloat || return solve(s, float.(C), eps; a, b, f0, g0, scale_cost)
     s.tau > 0 || throw(ArgumentError("tau must be > 0, got $(s.tau)"))
     V, P = size(C)
     _check_nonempty(V, P)
@@ -131,22 +119,21 @@ function solve(s::TemperedSoftmaxSolver, C::AbstractMatrix{T}, eps::Real;
     return OTResult(plan, ent, nothing, nothing, true, 1)
 end
 
-# ---------------------------------------------------------------------------
-# Greedy ablation solvers (ties break to first)
-# ---------------------------------------------------------------------------
+_informative(c) = maximum(c) > minimum(c)
 
 """
     MinCostGreedySolver()
 
 All of each particle's mass on its single lowest-cost vertex. Non-finite costs
-are sanitized first, so they are never picked over a finite one.
+are sanitized first, so they are never picked over a finite one. A constant
+column spreads uniformly, so the particle holds.
 """
 struct MinCostGreedySolver <: AbstractOTSolver end
 
 function solve(s::MinCostGreedySolver, C::AbstractMatrix{T}, eps::Real = 0.1;
         a = nothing, b = nothing, f0 = nothing, g0 = nothing,
-        scale_cost = nothing, last_eps = nothing) where {T}
-    T <: AbstractFloat || return solve(s, float.(C), eps; a, b, f0, g0, scale_cost, last_eps)
+        scale_cost = nothing) where {T}
+    T <: AbstractFloat || return solve(s, float.(C), eps; a, b, f0, g0, scale_cost)
     V, P = size(C)
     _check_nonempty(V, P)
     _warn_nonuniform_b(b, V)
@@ -155,8 +142,12 @@ function solve(s::MinCostGreedySolver, C::AbstractMatrix{T}, eps::Real = 0.1;
     plan = similar(Cs)
     fill!(plan, zero(T))
     for p in 1:P
-        v = argmin(view(Cs, :, p))
-        plan[v, p] = am[p]
+        c = view(Cs, :, p)
+        if _informative(c)
+            plan[argmin(c), p] = am[p]
+        else
+            plan[:, p] .= am[p] / V
+        end
     end
     ent = Float64(dot(Cs, plan))
     return OTResult(plan, ent, nothing, nothing, true, 1)
@@ -166,7 +157,8 @@ end
     TopKMeanSolver(; k=3)
 
 Uniform mass `a[p]/k_eff` over each particle's `k_eff = min(k, V)` lowest-cost
-vertices. Non-finite costs are sanitized first and rank last.
+vertices. Non-finite costs are sanitized first and rank last. A constant column
+spreads uniformly, so the particle holds.
 """
 Base.@kwdef struct TopKMeanSolver <: AbstractOTSolver
     k::Int = 3
@@ -179,8 +171,8 @@ end
 
 function solve(s::TopKMeanSolver, C::AbstractMatrix{T}, eps::Real = 0.1;
         a = nothing, b = nothing, f0 = nothing, g0 = nothing,
-        scale_cost = nothing, last_eps = nothing) where {T}
-    T <: AbstractFloat || return solve(s, float.(C), eps; a, b, f0, g0, scale_cost, last_eps)
+        scale_cost = nothing) where {T}
+    T <: AbstractFloat || return solve(s, float.(C), eps; a, b, f0, g0, scale_cost)
     V, P = size(C)
     _check_nonempty(V, P)
     _warn_nonuniform_b(b, V)
@@ -190,8 +182,12 @@ function solve(s::TopKMeanSolver, C::AbstractMatrix{T}, eps::Real = 0.1;
     plan = similar(Cs)
     fill!(plan, zero(T))
     for p in 1:P
-        # stable sort: ties go to the lowest index (torch.topk has no tie order)
-        idx = sortperm(view(Cs, :, p); alg = Base.Sort.DEFAULT_STABLE)
+        c = view(Cs, :, p)
+        if !_informative(c)
+            plan[:, p] .= am[p] / V
+            continue
+        end
+        idx = sortperm(c; alg = Base.Sort.DEFAULT_STABLE)
         mass = am[p] / k_eff
         for j in 1:k_eff
             plan[idx[j], p] = mass
@@ -200,10 +196,6 @@ function solve(s::TopKMeanSolver, C::AbstractMatrix{T}, eps::Real = 0.1;
     ent = Float64(dot(Cs, plan))
     return OTResult(plan, ent, nothing, nothing, true, 1)
 end
-
-# ---------------------------------------------------------------------------
-# KLSoftmaxSolver: iterative alpha-blended loop, softmax (lam=0) <-> Sinkhorn (lam=Inf)
-# ---------------------------------------------------------------------------
 
 """
     KLSoftmaxSolver(; lam=Inf, max_iterations=2000, threshold=1e-6)
@@ -230,14 +222,12 @@ Base.@kwdef mutable struct KLSoftmaxSolver <: AbstractOTSolver
     end
 end
 
-function kl_alpha(s::KLSoftmaxSolver, eps::Real)
-    s.lam == 0 ? 0.0 : (isinf(s.lam) ? 1.0 : s.lam / (s.lam + eps))
-end
+kl_alpha(s::KLSoftmaxSolver, eps::Real) = 1 / (1 + eps / s.lam)
 
 function solve(s::KLSoftmaxSolver, C::AbstractMatrix{T}, eps::Real;
         a = nothing, b = nothing, f0 = nothing, g0 = nothing,
-        scale_cost = nothing, last_eps = nothing) where {T}
-    T <: AbstractFloat || return solve(s, float.(C), eps; a, b, f0, g0, scale_cost, last_eps)
+        scale_cost = nothing) where {T}
+    T <: AbstractFloat || return solve(s, float.(C), eps; a, b, f0, g0, scale_cost)
     _check_eps(eps)
     isfinite(eps) ||
         throw(ArgumentError("KLSoftmaxSolver requires a finite epsilon, got $eps (use SoftmaxSolver for the infinite-temperature/uniform limit)"))
@@ -245,14 +235,11 @@ function solve(s::KLSoftmaxSolver, C::AbstractMatrix{T}, eps::Real;
     _check_nonempty(V, P)
     Cs = _prepare_cost(C, scale_cost)
     am = _align_marginal(a, P, Cs, "a")
-    # per-column centering keeps -Cs/eps finite and makes lam=0 match SoftmaxSolver;
-    # the shift is added back to ent_cost
     shift = dot(am, vec(minimum(Cs; dims = 1)))
     center_cols!(Cs)
     bm = _align_marginal(b, V, Cs, "b")
     epsT = T(eps)
     alpha = T(kl_alpha(s, eps))
-    # alpha == 1 is exact Sinkhorn, infeasible for mismatched total mass
     if alpha == 1
         ta, tb = sum(am), sum(bm)
         abs(ta - tb) <= sqrt(Base.eps(T)) * max(ta, tb) ||
@@ -267,13 +254,6 @@ function solve(s::KLSoftmaxSolver, C::AbstractMatrix{T}, eps::Real;
     ga = _align_dual(g0, V, T, "g0")
     f = fa === nothing ? zeros(T, P) : fa
     g = ga === nothing ? zeros(T, V) : ga
-    # duals scale ~O(eps): rescale warm starts when the schedule moved eps
-    if last_eps !== nothing && last_eps > 0 && (f0 !== nothing || g0 !== nothing) &&
-       abs(last_eps - eps) / max(eps, 1e-9) > 1e-6
-        sc = T(eps / last_eps)
-        f .*= sc
-        g .*= sc
-    end
     if !(all(isfinite, f) && all(isfinite, g))
         fill!(f, zero(T))
         fill!(g, zero(T))
@@ -284,16 +264,12 @@ function solve(s::KLSoftmaxSolver, C::AbstractMatrix{T}, eps::Real;
     gtmp = zeros(T, V)
 
     if alpha == 0
-        # softmax limit: closed form, independent of g (gtmp is the zero add term)
-        lse_cols!(ftmp, logK, gtmp)
-        @. f = epsT * (log_a - ftmp)
         fill!(g, zero(T))
         converged = true
         n_iters = 1
     else
         accm = zeros(T, V)
         accs = zeros(T, V)
-        # ping-pong buffers; f/g are private copies from _align_dual, safe to swap
         f_new = similar(f)
         g_new = similar(g)
         fdiv = similar(f)
@@ -322,20 +298,11 @@ function solve(s::KLSoftmaxSolver, C::AbstractMatrix{T}, eps::Real;
             f, f_new = f_new, f
             g, g_new = g_new, g
         end
-        # re-fit f to the final g so the plan columns carry a exactly
-        @. gdiv = g / epsT
-        lse_cols!(ftmp, logK, gdiv)
-        @. f = epsT * (log_a - ftmp)
     end
-
-    plan = exp.((f' .+ g .- Cs) ./ epsT)
-    if !all(isfinite, plan)
-        @warn "KLSoftmaxSolver produced non-finite transport entries; consider raising epsilon or lowering lam."
-        # Inf marks the cheapest vertices: saturate at floatmax/V, don't zero; NaN -> 0
-        plan .= ifelse.(isnan.(plan), zero(T), min.(plan, floatmax(T) / V))
-    end
+    lse_cols!(ftmp, logK, g ./ epsT)
+    @. f = epsT * (log_a - ftmp)
+    plan = softmax_cols!(similar(Cs), Cs .- g, epsT) .* am'
     ent = Float64(dot(Cs, plan) + shift)
-    # generalized KL(P'1 || b); the -q + b terms keep it >= 0 when masses differ
     q = max.(vec(sum(plan; dims = 2)), T(1e-30))
     bs = max.(bm, T(1e-30))
     s.last_marginal_violation = Float64(sum(q .* (log.(q) .- log.(bs)) .- q .+ bs))

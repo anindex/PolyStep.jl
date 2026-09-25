@@ -24,7 +24,9 @@ sphere(X) = vec(sum(abs2, X; dims = 1))
         @test isapprox(rm, 0.9) && sc == 0
         @test isapprox(update_trust_region(-1.0, -0.9, 1.0), 1.5)  # accurate improvement: expand
         @test isapprox(update_trust_region(-1.0, 1.0, 1.0), 0.25)  # opposite sign: large shrink
-        @test isapprox(update_trust_region(1.0, 1.0, 1.0), 1.0)  # predicted worsening: no expand
+        @test isapprox(update_trust_region(1.0, 1.0, 1.0), 0.5)  # predicted worsening: shrink
+        @test isapprox(update_trust_region(1.0, -1.0, 1.0), 0.5)
+        @test isapprox(update_trust_region(NaN, -1.0, 1.0), 0.5)
         @test isapprox(update_trust_region(0.0, -1.0, 1.0), 1.0)  # tiny prediction: unchanged
     end
 
@@ -40,7 +42,6 @@ sphere(X) = vec(sum(abs2, X; dims = 1))
         scales = PolyStep.probe_scales(Float64, K)
         G = zeros(d, P);
         H = zeros(d, P)
-        # 2e-3 is the default late-schedule probe radius; H must not collapse there
         for pr in (0.05, 2e-3)
             losses3 = zeros(K, 2d, P)
             for p in 1:P, i in 1:d, (sgn, off) in ((1.0, 0), (-1.0, d)), k in 1:K
@@ -60,7 +61,10 @@ sphere(X) = vec(sum(abs2, X; dims = 1))
         newton_step!(N, G, H; max_step_norm = 0.01)
         @test all(p -> norm(N[:, p]) <= 0.01 + 1e-12, 1:P)
         @test all(<=(0), predicted_improvement(G, H, N))            # descent step predicts improvement
-        # the mean form scores a realized move X1 - X in the rotated frame
+        N2 = zeros(2, 1)
+        newton_step!(N2, reshape([1e3, 1.0], 2, 1), reshape([1e-8, 1.0], 2, 1); max_step_norm = 1.0)
+        @test isapprox(vec(N2), [-1, -1] ./ sqrt(2))
+        @test predicted_improvement(zeros(1, 1), fill(-5.0, 1, 1), ones(1, 1))[1] == 0.5e-4
         X1 = X .+ 0.1 .* randn(rng, d, P)
         S = reduce(hcat, [R[:, :, p]' * (X1[:, p] - X[:, p]) for p in 1:P])
         @test isapprox(predicted_improvement_mean(G, H, R, X1, X),
@@ -73,14 +77,12 @@ sphere(X) = vec(sum(abs2, X; dims = 1))
         rng = Xoshiro(77)
         scales = PolyStep.probe_scales(Float64, K)
         pr = 0.6
-        # serial path and the threaded path past _KERNEL_BATCH_MIN particles
         for P in (4, PolyStep._KERNEL_BATCH_MIN)
             X = randn(rng, d, P)
             R = zeros(d, d, P)
             haar_rotations!(R, zeros(d, d, P), rng)
             Xp = zeros(d, K * V * P)
             PolyStep._probe_points_orthoplex!(Xp, X, R, pr, scales)
-            # column c = (p-1)*V*K + (v-1)*K + k; v=i is +e_i, v=d+i is -e_i
             Xref = similar(Xp)
             for p in 1:P, i in 1:d, k in 1:K
                 cplus = (p - 1) * V * K + (i - 1) * K + k
@@ -89,7 +91,6 @@ sphere(X) = vec(sum(abs2, X; dims = 1))
                 Xref[:, cminus] = X[:, p] .- pr * scales[k] .* R[:, i, p]
             end
             @test isapprox(Xp, Xref; atol = 1e-12)
-            # general-polytope kernel with the orthoplex directions gives the same points
             Xg = zeros(d, K * V * P)
             dirs = zeros(d, V, P)
             _batched_mul!(dirs, R, orthoplex_vertices(d))
@@ -148,12 +149,11 @@ sphere(X) = vec(sum(abs2, X; dims = 1))
     end
 
     @testset "scale_cost does not leak into adaptive state" begin
-        # huge divisor: solver input is scaled but prev_loss must stay raw-scale
         ps = PolyStepConfig(dim = 3, epsilon = 0.5, scale_cost = 1e6, use_adaptive_radius = true)
         st = init_state(ps, fill(2.0, 3, 4))
         cost = step!(sphere, ps, st; rng = Xoshiro(6))
-        @test st.prev_loss == cost
-        @test cost > 1.0            # raw sphere costs near ||x||^2 = 12, not 1e-5
+        @test st.prev_loss == mean(minimum, eachcol(st.Craw))
+        @test cost > 1.0
     end
 
     @testset "trust region + quadratic model" begin
@@ -179,7 +179,6 @@ sphere(X) = vec(sum(abs2, X; dims = 1))
         rng = Xoshiro(26)
         for _ in 1:8
             step!(sphere, ps, st; rng)
-            # an accepted refinement keeps the heavy-ball identity X - Xprev == lr*v
             @test isapprox(st.X - st.Xprev, ps.velocity_lr .* st.velocity; atol = 1e-12)
             # the trust-region prediction is for the move actually taken
             @test st.prev_predicted ==
@@ -194,7 +193,31 @@ sphere(X) = vec(sum(abs2, X; dims = 1))
         for _ in 1:5
             step!(sphere, ps, st; rng = Xoshiro(28))
         end
-        @test st.prog_ent.smoothed == 0.1 && st.last_eps == 0.1   # not inflated
+        @test st.prog_ent.smoothed == 0.1   # not inflated
+    end
+
+    @testset "trust-region proxy is the center value under a shrinking probe radius" begin
+        A = [3.0 1.0 0.0; 1.0 2.0 0.5; 0.0 0.5 1.0]
+        quad(X) = vec(sum(X .* (A * X); dims = 1)) ./ 2
+        ps = PolyStepConfig(dim = 3, epsilon = LinearEpsilon(init = 0.5, target = 0.01, decay = 0.1),
+            num_probe = 3, use_quadratic_model = true, trust_region = true)
+        st = init_state(ps, randn(Xoshiro(41), 3, 5))
+        rng = Xoshiro(42)
+        for _ in 1:4
+            Xc = copy(st.X)
+            step!(quad, ps, st; rng)
+            @test isapprox(st.prev_pre_step_loss, mean(quad(Xc)); rtol = 1e-10)
+        end
+    end
+
+    @testset "non-finite probes leave a finite quadratic model" begin
+        nanfar(X) = [x[1] > 1.2 ? NaN : sum(abs2, x) for x in eachcol(X)]
+        ps = PolyStepConfig(dim = 3, epsilon = 0.5, num_probe = 2, use_quadratic_model = true,
+            newton_refinement = true, trust_region = true)
+        st = init_state(ps, fill(1.0, 3, 4))
+        step!(nanfar, ps, st; rng = Xoshiro(43))
+        @test all(isfinite, st.G) && all(isfinite, st.H)
+        @test isfinite(st.prev_predicted)
     end
 
     @testset "newton refinement invalidates duals" begin
@@ -256,13 +279,11 @@ sphere(X) = vec(sum(abs2, X; dims = 1))
         end
         @test all(x -> lo <= x <= hi, st.X)
         @test all(x -> lo <= x <= hi, st.best_x)
-        # repair: snap evaluated candidates to a 0.5 grid; incumbent obeys it
         snap(X) = (X .= round.(X .* 2) ./ 2; X)
         ps_r = PolyStepConfig(dim = 3, epsilon = 0.5, repair = snap)
         st_r = init_state(ps_r, randn(Xoshiro(17), 3, 4))
         step!(sphere, ps_r, st_r; rng = Xoshiro(18))
         @test all(x -> isapprox(x, round(x * 2) / 2; atol = 1e-12), st_r.best_x)
-        # solve! scores a repaired copy of the iterate, so best_x stays on the grid
         st_s = init_state(ps_r, randn(Xoshiro(17), 3, 4))
         solve!(sphere, ps_r, st_s; rng = Xoshiro(18))
         @test all(x -> isapprox(x, round(x * 2) / 2; atol = 1e-12), st_s.best_x)
@@ -294,7 +315,6 @@ sphere(X) = vec(sum(abs2, X; dims = 1))
         _batched_matvec!(rotc, R, cent)
         X_fused = X .+ sr .* rotc
         @test isapprox(X_fused, X_exp; rtol = 1e-10)
-        # translation invariance: shifting X shifts the barycenter identically
         shift = randn(rng, d)
         X_exp2 = zeros(d, P)
         for p in 1:P, v in 1:V
@@ -310,10 +330,8 @@ sphere(X) = vec(sum(abs2, X; dims = 1))
         solve!(sphere, ps, st; rng = Xoshiro(21))
         @test 1 <= st.iteration <= 30
         @test length(st.costs) == st.iteration == length(st.disp_sqnorms)
-        # the final iterate is scored once (P evals); probes alone sit a radius off it
         @test st.evals == st.iteration * 6 * 8 + 8
         @test st.best_f <= minimum(sphere(st.X))
-        # orthoplex centroid (+/- weight difference) is bit-identical to Vt * Wn
         @test st.cent == orthoplex_vertices(3) * st.Wn
         stc = init_state(ps, randn(Xoshiro(20), 3, 8))
         solve!(sphere, ps, stc; rng = Xoshiro(21), callback = s -> s.iteration >= 2)
@@ -345,12 +363,9 @@ sphere(X) = vec(sum(abs2, X; dims = 1))
         @test_throws ArgumentError init_state(PolyStepConfig(dim = 3, ent_epsilon = ProgressiveEpsilon()), zeros(3, 2))
         @test_throws DimensionMismatch init_state(PolyStepConfig(dim = 4), zeros(3, 2))
         @test_throws ArgumentError init_state(PolyStepConfig(dim = 3, lb = -1.0), zeros(3, 2))
-        # a non-finite particle would freeze every particle through the NaN revert
         @test_throws ArgumentError init_state(PolyStepConfig(dim = 2), [0.0 NaN; 0.0 0.0])
-        # scale_cost typos fail at construction, before any objective evaluation
         @test_throws ArgumentError init_state(PolyStepConfig(dim = 2, scale_cost = :meen), zeros(2, 2))
         @test_throws ArgumentError init_state(PolyStepConfig(dim = 2, scale_cost = -1.0), zeros(2, 2))
-        # epsilon = Inf only with scheduled radii (unscheduled ones scale by it)
         @test_throws ArgumentError init_state(PolyStepConfig(dim = 2, epsilon = Inf), zeros(2, 2))
         @test init_state(PolyStepConfig(dim = 2, epsilon = Inf, step_radius = LinearEpsilon(),
             probe_radius = LinearEpsilon()), zeros(2, 2)).iteration == 0

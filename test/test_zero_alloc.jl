@@ -1,5 +1,3 @@
-# Steady-state allocation checks (@allocated after warmup). solve() and step!
-# allocate small outputs by design; the kernels must not.
 using PolyStep: softmax_cols!, lse_cols!, lse_rows!, sanitize_cost!, scale_cost!,
                  normalize_particle_masses!, _cost_from_losses!, _probe_points_orthoplex!,
                  haar_rotations!, fd_gradient!, fd_hessian_diag!, newton_step!
@@ -35,7 +33,7 @@ using PolyStep: softmax_cols!, lse_cols!, lse_rows!, sanitize_cost!, scale_cost!
         () -> lse_rows!(out_v, C, addp, accm, accs),
         () -> sanitize_cost!(C),                       # all-finite fast path
         () -> scale_cost!(Cm, C, :mean),
-        () -> normalize_particle_masses!(W, abs.(C)),  # abs.(C) allocates; the W kernel must not
+        () -> normalize_particle_masses!(W, abs.(C)),
         () -> _cost_from_losses!(Cm, losses, K),
         () -> _probe_points_orthoplex!(Xp, X, R, T(0.5), scales),
         () -> haar_rotations!(R, Z, rng),
@@ -43,14 +41,12 @@ using PolyStep: softmax_cols!, lse_cols!, lse_rows!, sanitize_cost!, scale_cost!
         () -> fd_hessian_diag!(H, L3, scales, 0.5),
         () -> newton_step!(N, G, H; max_step_norm = 1.0)
     ]
-    # warmup twice (Polyester lazily initializes thread state on first call)
     for f in checks
         f()
         f()
     end
     absC = abs.(C)
     @test @allocated(softmax_cols!(W, C, 0.3)) == 0
-    # the LV @turbo lse kernels box an intermediate on Julia 1.10, not on 1.11+
     lse_bound = VERSION < v"1.11" ? 2048 : 0
     @test @allocated(lse_cols!(out_p, C, addv)) <= lse_bound
     @test @allocated(lse_rows!(out_v, C, addp, accm, accs)) <= lse_bound
@@ -62,15 +58,12 @@ using PolyStep: softmax_cols!, lse_cols!, lse_rows!, sanitize_cost!, scale_cost!
     @test @allocated(fd_hessian_diag!(H, L3, scales, 0.5)) == 0
     # Julia 1.10 boxes the keyword NamedTuple (0 B on 1.11+)
     @test @allocated(newton_step!(N, G, H; max_step_norm = 1.0)) <= 512
-    # Polyester @batch: constant per-call task overhead when nthreads > 1
     @test @allocated(_probe_points_orthoplex!(Xp, X, R, T(0.5), scales)) <= 512
     @test @allocated(haar_rotations!(R, Z, rng)) <= 512
 
-    # ES ask! reuses its candidate buffer instead of allocating (d, popsize) per call
     es = PolyStepES(8; num_particles = 2, rng = Xoshiro(7))
     ask!(es)
     tell!(es, zeros(popsize(es)))
-    # Julia 1.10: the cached @batch QR kernel allocates per extra thread
     @test @allocated(ask!(es)) <= (VERSION < v"1.11" ? 512 : 0)
     tell!(es, zeros(popsize(es)))
 
@@ -86,13 +79,11 @@ using PolyStep: softmax_cols!, lse_cols!, lse_rows!, sanitize_cost!, scale_cost!
     end
     @test @allocated(PolyStep.step!(fobj, ps_soft, st_soft; rng)) < 32_000
     @test @allocated(PolyStep.step!(fobj, ps_sink, st_sink; rng)) < 32_000
-    # Sinkhorn iterations allocate nothing: 1000 fixed iterations stay a small constant
     s_fx = SinkhornSolver(threshold = 0.0, max_iterations = 1000)
     C_fx = rand(rng, 16, 8)
     PolyStep.solve(s_fx, C_fx, 0.1)
     @test @allocated(PolyStep.solve(s_fx, C_fx, 0.1)) < 4_000
 
-    # quadratic model + Newton + trust region + biased rotation: no per-step (d,P) allocations
     ps_quad = PolyStepConfig(dim = 8, num_probe = 2, use_quadratic_model = true,
         newton_refinement = true, trust_region = true, biased_rotation = true)
     st_quad = init_state(ps_quad, randn(rng, 8, 64))

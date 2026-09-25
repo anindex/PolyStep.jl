@@ -1,12 +1,7 @@
-# Shared numeric kernels. cost/plan are (V, P), so dims=1 reductions are contiguous.
-# Each kernel has an Array fast path and a generic broadcast method for GPU arrays.
-
-# SLEEFPirates exp is branch-free and SIMD-vectorizes; table-based Base.exp does not
 @inline exp_fast(x::Float64) = SLEEFPirates.exp(x)
 @inline exp_fast(x::Float32) = SLEEFPirates.exp(x)
 @inline exp_fast(x) = exp(x)
 
-# set by the LoopVectorization extension; a Bool flag keeps dispatch static and alloc-free
 const _TURBO_ACTIVE = Ref(false)
 function _lse_cols_turbo! end
 function _lse_rows_turbo! end
@@ -33,7 +28,6 @@ function splitmix64(seed::Integer, extras::Integer...)
     return z
 end
 
-# NaN-safe argmin (findmin returns NaN if any entry is NaN); bidx == 0: none finite
 function _best_finite(x::AbstractVector)
     bf = Inf
     bidx = 0
@@ -47,7 +41,6 @@ function _best_finite(x::AbstractVector)
     return bf, bidx
 end
 
-# thread only past this many columns; below it spawn overhead dominates
 const _KERNEL_BATCH_MIN = 1024
 
 """
@@ -59,12 +52,10 @@ const _KERNEL_BATCH_MIN = 1024
 function softmax_cols!(W::Matrix{T}, C::Matrix{T}, eps::Real) where {T <: AbstractFloat}
     V, P = size(C)
     size(W) == (V, P) || throw(DimensionMismatch("W $(size(W)) vs C $(size(C))"))
-    # uniform limit taken directly: -Inf * (1/Inf) would be NaN at extreme costs
     if isinf(eps)
         fill!(W, one(T) / V)
         return W
     end
-    # floatmax clamp: 1/eps = Inf would give 0*Inf = NaN at the argmin
     invabseps = min(one(T) / T(eps), floatmax(T))
     if P >= _KERNEL_BATCH_MIN
         @batch for p in 1:P
@@ -81,8 +72,6 @@ end
 @inline function _softmax_col!(
         W::AbstractMatrix{T}, C::AbstractMatrix{T}, invabseps::T, V::Int, p::Int) where {T}
     @inbounds begin
-        # shift by the column min before scaling (-C/eps can overflow); the argmin
-        # term is exp(0) = 1, so the normalizer is >= 1
         cmin = C[1, p]
         @simd for v in 2:V
             cv = C[v, p]
@@ -130,7 +119,7 @@ function _lse_cols_base!(out::AbstractVector{T}, A::Matrix{T},
         add::AbstractVector{T}) where {T <: AbstractFloat}
     V, P = size(A)
     @inbounds for p in 1:P
-        m = typemin(T)
+        m = -floatmax(T)
         @simd for v in 1:V
             x = A[v, p] + add[v]
             m = ifelse(x > m, x, m)
@@ -146,7 +135,7 @@ end
 
 function lse_cols!(out::AbstractVector, A::AbstractMatrix, add::AbstractVector)
     B = A .+ add
-    m = maximum(B; dims = 1)
+    m = max.(maximum(B; dims = 1), -floatmax(eltype(B)))
     out .= vec(m .+ log.(sum(exp.(B .- m); dims = 1)))
     return out
 end
@@ -168,7 +157,7 @@ end
 function _lse_rows_base!(out::AbstractVector{T}, A::Matrix{T}, add::AbstractVector{T},
         accm::Vector{T}, accs::Vector{T}) where {T <: AbstractFloat}
     V, P = size(A)
-    fill!(accm, typemin(T))
+    fill!(accm, -floatmax(T))
     fill!(accs, zero(T))
     @inbounds for p in 1:P
         ap = add[p]
@@ -176,7 +165,6 @@ function _lse_rows_base!(out::AbstractVector{T}, A::Matrix{T}, add::AbstractVect
             x = A[v, p] + ap
             mo = accm[v]
             mn = ifelse(x > mo, x, mo)
-            # exp(typemin - mn) underflows to 0, so the first finite x wins cleanly
             accs[v] = accs[v] * exp_fast(mo - mn) + exp_fast(x - mn)
             accm[v] = mn
         end
@@ -189,7 +177,7 @@ end
 
 function lse_rows!(out::AbstractVector, A::AbstractMatrix, add::AbstractVector, _accm, _accs)
     B = A .+ add'
-    m = maximum(B; dims = 2)
+    m = max.(maximum(B; dims = 2), -floatmax(eltype(B)))
     out .= vec(m .+ log.(sum(exp.(B .- m); dims = 2)))
     return out
 end
@@ -251,14 +239,12 @@ function scale_cost!(Cs::AbstractMatrix{T}, C::AbstractMatrix, spec::Symbol) whe
     m = minimum(C) / 2
     h = if spec === :mean
         v = mean(c -> c / 2 - m, C)
-        # the sum can overflow to Inf; the max is always finite, so fall back
         isfinite(v) ? v : maximum(c -> c / 2 - m, C)
     elseif spec === :max || spec === :max_cost   # :max_cost is the Python name
         maximum(c -> c / 2 - m, C)
     else
         throw(ArgumentError("scale_cost spec must be nothing, :mean, :max, or a positive real; got :$spec"))
     end
-    # floatmin: T(5e-11) is 0 in Float16, and a constant cost would give 0/0
     Cs .= (C ./ 2 .- m) ./ max(T(h), T(5e-11), floatmin(T))
     return Cs
 end
@@ -328,7 +314,6 @@ end
         @simd for v in 1:V
             s += plan[v, p]
         end
-        # mass at/below the floor zeroes the column so the particle holds
         invs = s > T(1e-12) ? one(T) / s : zero(T)
         @simd ivdep for v in 1:V
             Wn[v, p] = plan[v, p] * invs
@@ -364,7 +349,6 @@ function _batched_mul!(Y::AbstractArray{<:Any, 3}, A::AbstractArray{<:Any, 3}, B
     return Y
 end
 
-# hand-written gemv: faster than BLAS on views at small d, and allocation-free
 """
     _batched_matvec!(Y, A, X) -> Y
 

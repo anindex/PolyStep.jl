@@ -1,7 +1,3 @@
-# Log-domain Sinkhorn. Layout (V, P): the f-update reduces contiguous columns
-# (lse_cols!), the g-update streams over particles (lse_rows!), no transpose.
-
-# scratch reused across solve calls; rebuilt when eltype or shape changes
 mutable struct SinkhornWorkspace{T}
     Cs::Matrix{T}
     logK::Matrix{T}
@@ -83,8 +79,6 @@ function _align_dual(init, n::Integer, ::Type{T}, name::String) where {T}
     return convert(Vector{T}, collect(init))
 end
 
-# Lyapunov D(f,g) = <f,a> + <g,b> - eps*sum(P), valid off the marginal constraint
-# (Anderson accept gate). tmpP (P) and gdiv (V) are overwritten scratch.
 function _dual_objective(f::Vector{T}, g::Vector{T}, logK::Matrix{T}, am, bm, epsT::T,
         tmpP::Vector{T}, gdiv::Vector{T}) where {T}
     @. gdiv = g / epsT
@@ -99,7 +93,6 @@ function _dual_objective(f::Vector{T}, g::Vector{T}, logK::Matrix{T}, am, bm, ep
     return dot(f, am) + dot(g, bm) - epsT * mass
 end
 
-# one SOR sweep (f then g); top-level since a closure would box the buffers
 function _sor_iterate!(f, g, omegaT, epsT, logK, log_a, log_b,
         ftmp, gtmp, fdiv, gdiv, accm, accs)
     gdiv .= g ./ epsT
@@ -113,8 +106,8 @@ end
 
 function solve(s::SinkhornSolver, C::AbstractMatrix{T}, eps::Real;
         a = nothing, b = nothing, f0 = nothing, g0 = nothing,
-        scale_cost = nothing, last_eps = nothing) where {T}
-    T <: AbstractFloat || return solve(s, float.(C), eps; a, b, f0, g0, scale_cost, last_eps)
+        scale_cost = nothing) where {T}
+    T <: AbstractFloat || return solve(s, float.(C), eps; a, b, f0, g0, scale_cost)
     _check_eps(eps)
     isfinite(eps) ||
         throw(ArgumentError("Sinkhorn requires a finite epsilon, got $eps (the log-domain dual iteration is undefined at infinite temperature)"))
@@ -133,10 +126,8 @@ function solve(s::SinkhornSolver, C::AbstractMatrix{T}, eps::Real;
     end
     am = _align_marginal(a, P, Cs, "a")
     shift = dot(am, vec(minimum(Cs; dims = 1)))   # added back to ent_cost
-    # per-column centering (plan-invariant) keeps -Cs/eps finite at extreme costs
     center_cols!(Cs)
     bm = _align_marginal(b, V, Cs, "b")
-    # unequal masses are infeasible (fixed mode would still report success)
     tot_a, tot_b = sum(am), sum(bm)
     abs(tot_a - tot_b) <= sqrt(Base.eps(T)) * max(tot_a, tot_b) ||
         throw(ArgumentError("Sinkhorn marginals must have equal total mass; got sum(a)=$tot_a, sum(b)=$tot_b"))
@@ -156,25 +147,34 @@ function solve(s::SinkhornSolver, C::AbstractMatrix{T}, eps::Real;
         @. log_b = log(max(bm, T(1e-30)))
     end
 
-    # --- dual initialization (warm start / data-dependent / zeros) ---
+    local ftmp, gtmp, fdiv, gdiv, accm, accs
+    if ws === nothing
+        ftmp = similar(Cs, T, P)
+        gtmp = similar(Cs, T, V)
+        fdiv = similar(Cs, T, P)
+        gdiv = similar(Cs, T, V)
+        accm = similar(Cs, T, V)
+        accs = similar(Cs, T, V)
+    else
+        ftmp = ws.ftmp
+        gtmp = ws.gtmp
+        fdiv = ws.fdiv
+        gdiv = ws.gdiv
+        accm = ws.accm
+        accs = ws.accs
+    end
+
     if s.data_dependent_init && f0 === nothing && g0 === nothing
-        f = .-vec(mean(Cs; dims = 1))   # per-particle mean over vertices
-        g = .-vec(mean(Cs; dims = 2))   # per-vertex mean over particles
+        f = fill!(similar(Cs, T, P), zero(T))
+        g = fill!(similar(Cs, T, V), zero(T))
+        _sor_iterate!(f, g, one(T), epsT, logK, log_a, log_b,
+            ftmp, gtmp, fdiv, gdiv, accm, accs)
     else
         fa = _align_dual(f0, P, T, "f0")
         ga = _align_dual(g0, V, T, "g0")
         # same array backend as Cs
         f = fa === nothing ? fill!(similar(Cs, T, P), zero(T)) : fa
         g = ga === nothing ? fill!(similar(Cs, T, V), zero(T)) : ga
-    end
-
-    # rescale warm starts by the eps ratio (u = f/eps held fixed), before the clamp
-    if last_eps !== nothing && last_eps > 0 && (f0 !== nothing || g0 !== nothing)
-        if abs(last_eps - eps) / max(eps, 1e-9) > 1e-6
-            sc = T(eps / last_eps)
-            f .*= sc
-            g .*= sc
-        end
     end
 
     # clamp warm starts to the cost magnitude
@@ -188,8 +188,6 @@ function solve(s::SinkhornSolver, C::AbstractMatrix{T}, eps::Real;
         clamp!(g, -mad, mad)
     end
 
-    # gauge shift f+c, g-c keeps the plan; separate mean subtraction is not a
-    # valid gauge under omega != 1
     c = T(0.5) * (mean(g) - mean(f))
     f .+= c
     g .-= c
@@ -208,31 +206,12 @@ function solve(s::SinkhornSolver, C::AbstractMatrix{T}, eps::Real;
     omega = s.omega
     omegaT = T(omega)
 
-    # scratch: every use overwrites before reading, so undef is safe
-    local ftmp, gtmp, fdiv, gdiv, accm, accs
-    if ws === nothing
-        ftmp = similar(Cs, T, P)
-        gtmp = similar(Cs, T, V)
-        fdiv = similar(Cs, T, P)
-        gdiv = similar(Cs, T, V)
-        accm = similar(Cs, T, V)
-        accs = similar(Cs, T, V)
-    else
-        ftmp = ws.ftmp
-        gtmp = ws.gtmp
-        fdiv = ws.fdiv
-        gdiv = ws.gdiv
-        accm = ws.accm
-        accs = ws.accs
-    end
-
     if fixed_mode
         for i in 1:(s.max_iterations)
             _sor_iterate!(f, g, omegaT, epsT, logK, log_a, log_b,
                 ftmp, gtmp, fdiv, gdiv, accm, accs)
             n_iters = i
         end
-        # finite means success (else ProgressiveEpsilon inflates epsilon)
         if !(all(isfinite, f) && all(isfinite, g))
             fill!(f, zero(T))
             fill!(g, zero(T))
@@ -248,7 +227,6 @@ function solve(s::SinkhornSolver, C::AbstractMatrix{T}, eps::Real;
         div_patience = 3
         omega_capped = false
 
-        # the Anderson branch allocates per step (only when anderson_depth > 0)
         for i in 1:(s.max_iterations)
             use_anderson = s.anderson_depth > 0 && i % s.check_every == 0
             local f_old, g_old
@@ -276,15 +254,13 @@ function solve(s::SinkhornSolver, C::AbstractMatrix{T}, eps::Real;
                         delta_r[(P + 1):end, j] .= aa_r[j + 1][2] .- aa_r[j][2]
                     end
                     current_r = vcat(r_f, r_g)
-                    # Tikhonov-regularized LS via the augmented system
-                    # [dR; sqrt(lam) I] alpha = [r; 0]; lam tracks ||dR||^2
                     lam = max(T(1e-8) * sum(abs2, delta_r), T(1e-30))
                     augA = vcat(delta_r, sqrt(lam) * Matrix{T}(I, k, k))
                     augb = vcat(current_r, zeros(T, k))
                     alpha = try
                         augA \ augb
                     catch
-                        nothing   # ill-conditioned: fall back to the plain iterate
+                        nothing
                     end
                     if alpha !== nothing && all(isfinite, alpha) && norm(alpha) < 1e3
                         delta_x = Matrix{T}(undef, P + V, k)
@@ -302,8 +278,6 @@ function solve(s::SinkhornSolver, C::AbstractMatrix{T}, eps::Real;
                             lyap_plain = _dual_objective(f, g, logK, am, bm, epsT, ftmp, gdiv)
                             lyap_comb = _dual_objective(
                                 f_c, g_c, logK, am, bm, epsT, ftmp, gdiv)
-                            # accept only if not worse than the plain step and
-                            # the previous iterate; else keep the plain step
                             if lyap_comb >= lyap_plain - 1e-6 && lyap_comb >= lyap_prev - 1e-6
                                 f = f_c
                                 g = g_c
@@ -314,7 +288,6 @@ function solve(s::SinkhornSolver, C::AbstractMatrix{T}, eps::Real;
             end
             n_iters = i
 
-            # always check the last iteration, or a converged solve reports false
             if i % s.check_every == 0 || i == s.max_iterations
                 if !(all(isfinite, f) && all(isfinite, g))
                     fill!(f, zero(T))
@@ -336,7 +309,6 @@ function solve(s::SinkhornSolver, C::AbstractMatrix{T}, eps::Real;
                 err = Float64(max(marg_a_err, marg_b_err))
                 omega_old = omega
 
-                # divergence detector: repeated dual-norm growth latches omega to 1
                 if omega > 1.5
                     dual_norm = Float64(maximum(abs, f) + maximum(abs, g))
                     if dual_norm > div_prev_norm * 1.05
@@ -345,7 +317,7 @@ function solve(s::SinkhornSolver, C::AbstractMatrix{T}, eps::Real;
                             @warn "Sinkhorn divergence detected with omega=$(round(omega; digits=2)) " *
                                   "after $div_patience consecutive growth checks; backing omega off to 1.0."
                             omega = 1.0
-                            s.omega = 1.0   # persist the cap so the next solve does not re-diverge
+                            s.omega = 1.0
                             omegaT = T(omega)
                             omega_capped = true
                             div_growth = 0
@@ -356,8 +328,6 @@ function solve(s::SinkhornSolver, C::AbstractMatrix{T}, eps::Real;
                     div_prev_norm = dual_norm
                 end
 
-                # Lehmann adaptive omega: estimate the rate only while omega == 1;
-                # relaxed or Anderson-jumped residuals give a wrong rate
                 if s.adaptive_omega && !omega_capped && omega == 1.0
                     if !isnan(prev_err) && prev_err > 1e-12 && 0 < err < prev_err
                         r = min(err / prev_err, 0.99)
@@ -385,8 +355,6 @@ function solve(s::SinkhornSolver, C::AbstractMatrix{T}, eps::Real;
     # logK is dead past the loop; reuse it as log-plan scratch
     logP = ws === nothing ? ((f' .+ g .- Cs) ./ epsT) : (@. ws.logK = (f' + g - Cs) / epsT)
     plan = exp.(logP)
-    # columns past exp's range (Inf, or all-zero underflow) get a per-column max
-    # shift; healthy columns are untouched
     @inbounds for p in 1:P
         colfinite = true
         colmass = zero(T)
@@ -402,7 +370,6 @@ function solve(s::SinkhornSolver, C::AbstractMatrix{T}, eps::Real;
                     plan[v, p] = exp_fast(logP[v, p] - m)
                 end
             else
-                # all -Inf or NaN: zero column, a no-op step via the mass floor
                 for v in 1:V
                     plan[v, p] = zero(T)
                 end

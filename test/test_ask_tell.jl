@@ -19,7 +19,6 @@ sphere_b(X) = vec(sum(abs2, X; dims = 1))
         # non-finite x0 would freeze every particle
         @test_throws ArgumentError PolyStepES(2; x0 = [0.0, NaN])
         @test_throws ArgumentError PolyStepES(2; num_particles = 2, x0 = [0.0 Inf; 0.0 0.0])
-        # scale_cost spec checked at construction, before any evaluation
         @test_throws ArgumentError PolyStepES(3; scale_cost = :meen)
         @test_throws ArgumentError PolyStepES(3; scale_cost = -1.0)
         @test_throws ArgumentError PolyStepES(3; scale_cost = 0.0)
@@ -51,7 +50,6 @@ sphere_b(X) = vec(sum(abs2, X; dims = 1))
     end
 
     @testset "candidate geometry" begin
-        # candidates are X +/- sr * R[:,i,p]: antithetic pairs around each particle
         es = PolyStepES(4; num_particles = 2, step_radius = 0.7,
             x0 = [1.0, -1.0, 0.5, 2.0], rng = Xoshiro(3))
         X = ask!(es)
@@ -72,7 +70,6 @@ sphere_b(X) = vec(sum(abs2, X; dims = 1))
         tell!(es, fit)
         @test es.best_f == minimum(fit)
         @test es.best_x == X[:, argmin(fit)]
-        # all-NaN fitness: no valid evaluation, so the iterate is held unchanged
         Xheld = copy(es.X)
         ask!(es)
         tell!(es, fill(NaN, popsize(es)))
@@ -100,7 +97,6 @@ sphere_b(X) = vec(sum(abs2, X; dims = 1))
         es = minimize(sphere_b, 10; steps = 300, x0 = fill(0.5, 10), rng = Xoshiro(0))
         @test es.best_f <= sphere_b(es.X)[1]
         @test es.evals == 300 * popsize(es) + 1
-        # the scored iterate is repaired first, so best_x stays integral
         rnd(X) = (X .= round.(X); X)
         esr = minimize(sphere_b, 3; steps = 0, repair = rnd, x0 = fill(0.4, 3))
         @test esr.best_x == zeros(3) && esr.best_f == 0.0
@@ -157,7 +153,6 @@ sphere_b(X) = vec(sum(abs2, X; dims = 1))
             @test all(x -> lo <= x <= hi, es.X)   # barycenter of box points stays in box
         end
         @test all(x -> lo <= x <= hi, es.best_x)
-        # integrality via repair: round candidates; incumbent is integer
         rnd(X) = (X .= round.(X); X)
         esi = PolyStepES(3; step_radius = 1.4, repair = rnd, x0 = fill(2.6, 3),
             rng = Xoshiro(32))

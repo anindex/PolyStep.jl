@@ -1,4 +1,3 @@
-# Optimization.jl extension smoke tests; run only when OptimizationBase resolves.
 using OptimizationBase
 using OptimizationBase: SciMLBase
 
@@ -34,7 +33,8 @@ using OptimizationBase: SciMLBase
 
     @testset "scalar objective path (warns once, still works)" begin
         prob = OptimizationProblem(sphere, u0)
-        sol = SciMLBase.solve(prob, PolyStepOptimizer(); maxiters = 20, rng = Xoshiro(2))
+        sol = @test_logs (:warn, r"one candidate at a time") match_mode = :any SciMLBase.solve(
+            prob, PolyStepOptimizer(); maxiters = 20, rng = Xoshiro(2))
         @test sol.retcode == SciMLBase.ReturnCode.Success
         @test isfinite(sol.objective)
     end
@@ -74,7 +74,8 @@ using OptimizationBase: SciMLBase
         fm(u, p) = sum(abs2, u * u' - target)          # needs u as a 2x2 matrix
         U0 = [1.0 0.0; 0.0 1.0]
         prob = OptimizationProblem(fm, U0; lb = fill(-3.0, 2, 2), ub = fill(3.0, 2, 2))
-        sol = SciMLBase.solve(prob, PolyStepOptimizer(); maxiters = 50, rng = Xoshiro(5))
+        sol = @test_logs min_level = Logging.Error SciMLBase.solve(prob, PolyStepOptimizer();
+            maxiters = 50, rng = Xoshiro(5))
         @test sol.u isa Matrix{Float64} && size(sol.u) == size(U0)
         @test sol.objective < fm(U0, nothing)
     end

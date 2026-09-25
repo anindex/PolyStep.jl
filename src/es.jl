@@ -1,6 +1,3 @@
-# PolyStepES ask/tell. Candidates are clamped/repaired before caching, so the
-# evaluated and projected points match and the barycenter stays in bounds.
-
 """
     PolyStepES(dim; num_particles=1, epsilon=0.5, step_radius=0.5,
                solver=SoftmaxSolver(), scale_cost=:mean, x0=nothing,
@@ -41,11 +38,11 @@ mutable struct PolyStepES{
     const rng::RNG
     X::Matrix{T}                 # (d, P)
     pending::Union{Nothing, Matrix{T}}   # points at askbuf between ask! and tell!
-    const askbuf::Matrix{T}      # (d, popsize) candidates, refilled each ask!
+    const askbuf::Matrix{T}
     const R::Array{T, 3}
     const Wn::Matrix{T}          # (V, P)
-    const Cbuf::Matrix{T}        # (V, P) fitness -> cost staging, reused per tell!
-    const Xnew::Matrix{T}        # (d, P) barycenter accumulator, reused per tell!
+    const Cbuf::Matrix{T}
+    const Xnew::Matrix{T}
     best_x::Vector{T}
     best_f::Float64
     evals::Int
@@ -61,7 +58,6 @@ function PolyStepES(dim::Integer; num_particles::Integer = 1, epsilon::Real = 0.
     epsilon > 0 || throw(ArgumentError("epsilon must be > 0, got $epsilon"))
     (isfinite(step_radius) && step_radius >= 0) ||
         throw(ArgumentError("step_radius must be finite and >= 0, got $step_radius"))
-    # reject a bad spec now, not after the first population is evaluated
     scale_cost === nothing || scale_cost!(zeros(1, 1), zeros(1, 1), scale_cost)
     (lb === nothing) == (ub === nothing) ||
         throw(ArgumentError("provide both lb and ub or neither"))
@@ -123,7 +119,7 @@ function ask!(es::PolyStepES{T}) where {T}
     d = es.dim
     P = es.num_particles
     haar_rotations!(es.R, es.R, es.rng)   # R doubles as the Gaussian scratch
-    C = es.askbuf                # reused; tell! consumes it before the next ask!
+    C = es.askbuf
     sr = T(es.step_radius)
     @inbounds for p in 1:P
         base = (p - 1) * 2d
@@ -158,7 +154,6 @@ function tell!(es::PolyStepES{T}, fitness::AbstractVector) where {T}
     d = es.dim
     P = es.num_particles
     V = 2d
-    # no finite fitness: hold every particle (a uniform softmax would drift)
     fmin, idx = _best_finite(fitness)
     if idx == 0
         es.evals += ps
@@ -171,7 +166,6 @@ function tell!(es::PolyStepES{T}, fitness::AbstractVector) where {T}
     end
     local plan
     if es.solver isa SoftmaxSolver
-        # fast path: softmax weights already equal the mass-normalized plan
         sanitize_cost!(C)
         es.scale_cost === nothing || scale_cost!(C, C, es.scale_cost)
         softmax_cols!(es.Wn, C, es.epsilon)
@@ -186,7 +180,6 @@ function tell!(es::PolyStepES{T}, fitness::AbstractVector) where {T}
     fill!(X_new, zero(T))
     @inbounds for p in 1:P
         if plan !== nothing
-            # hold particles whose plan column has (near-)zero mass (Wn ~ 0)
             mass = zero(T)
             for v in 1:V
                 mass += plan[v, p]
@@ -262,7 +255,6 @@ function minimize(f, dim::Integer; steps::Integer = 200, callback = nothing, kwa
     return _score_iterate!(es, f)
 end
 
-# candidates sit step_radius off the iterate, so score the iterate itself once
 function _score_iterate!(es::PolyStepES, f)
     Xc = copy(es.X)
     es.lb === nothing || (Xc .= clamp.(Xc, es.lb, es.ub))

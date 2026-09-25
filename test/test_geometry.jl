@@ -1,8 +1,14 @@
 using PolyStep: orthoplex_vertices, simplex_vertices, cube_vertices, polytope_vertices,
                  num_vertices, probe_scales, haar_rotations!, biased_rotation!,
-                 _qr_slices_static!, _qr_slices_lapack!, _mezzadri_phase
+                 _qr_slices_static!, _org2r!, _mezzadri_phase
 
 isrotation(Q; atol = 1e-8) = isapprox(Q' * Q, I; atol) && isapprox(det(Q), 1; atol)
+
+function ks_distance(x, y)
+    xs, ys = sort(x), sort(y)
+    return maximum(t -> abs(searchsortedlast(xs, t) - searchsortedlast(ys, t)), [xs; ys]) /
+           length(xs)
+end
 
 @testset "geometry" begin
     @testset "orthoplex template" begin
@@ -67,20 +73,20 @@ isrotation(Q; atol = 1e-8) = isapprox(Q' * Q, I; atol) && isapprox(det(Q), 1; at
         @test _mezzadri_phase(-3.0) === -1.0
     end
 
-    @testset "haar rotations d=$d" for d in (2, 3, 5, 8, 12)
+    @testset "haar rotations d=$d $T" for d in (2, 3, 5, 8, 9, 20, 191, 192),
+                                          T in (Float32, Float64)
         P = 32
         rng = Xoshiro(7)
-        R = zeros(d, d, P)
-        Z = zeros(d, d, P)
+        R = zeros(T, d, d, P)
+        Z = zeros(T, d, d, P)
         haar_rotations!(R, Z, rng)
-        for p in 1:P
-            @test isrotation(R[:, :, p])
-        end
+        atol = T == Float32 ? 1e-4 : 1e-8
+        @test all(p -> isrotation(Float64.(R[:, :, p]); atol), 1:P)
         # determinism: same seed -> identical rotations
-        R2 = zeros(d, d, P)
-        haar_rotations!(R2, zeros(d, d, P), Xoshiro(7))
+        R2 = zeros(T, d, d, P)
+        haar_rotations!(R2, zeros(T, d, d, P), Xoshiro(7))
         @test R2 == R
-        R3 = zeros(d, d, P)
+        R3 = zeros(T, d, d, P)
         @test haar_rotations!(R3, R3, Xoshiro(7)) == R   # Z may alias R
         if d == 2
             for p in 1:P
@@ -98,26 +104,38 @@ isrotation(Q; atol = 1e-8) = isapprox(Q' * Q, I; atol) && isapprox(det(Q), 1; at
         @test abs(mean(R[3, 2, :])) < 0.05
     end
 
-    @testset "cross-impl QR agreement d=$d" for d in 3:8
-        # StaticArrays path vs LAPACK path on identical full-rank Gaussian Z
-        P = 16
-        Z = randn(Xoshiro(100 + d), d, d, P)
-        R1 = zeros(d, d, P)
-        R2 = zeros(d, d, P)
-        _qr_slices_static!(R1, copy(Z), Val(d))
-        _qr_slices_lapack!(R2, copy(Z))
-        @test isapprox(R1, R2; rtol = 1e-10)
+    @testset "Stewart draws match Haar QR draws d=$d" for d in (9, 20)
+        n = 4000
+        R = zeros(d, d, n)
+        haar_rotations!(R, R, Xoshiro(8))
+        @test maximum(abs, mean(R; dims = 3)) < 5 / sqrt(d * n)
+        @test maximum(abs, d .* mean(R .^ 2; dims = 3) .- 1) < 0.15
+        rng = Xoshiro(9)
+        ref = map(1:n) do _
+            F = qr(randn(rng, d, d))
+            Q = Matrix(F.Q) * Diagonal(sign.(diag(F.R)))
+            det(Q) < 0 && (Q[:, 1] .*= -1)
+            Q
+        end
+        for (i, j) in ((1, 1), (d, d), (1, d), (d, 1))
+            @test ks_distance(R[i, j, :], getindex.(ref, i, j)) < 0.05
+        end
+    end
+
+    @testset "_org2r! matches LAPACK orgqr d=$d" for d in (9, 50)
+        A = randn(Xoshiro(d), d, d)
+        tau = zeros(d)
+        LAPACK.geqrf!(A, tau)
+        @test isapprox(_org2r!(copy(A), tau), LAPACK.orgqr!(copy(A), tau); atol = 1e-13)
     end
 
     @testset "static path SO(d) on a zero subcolumn" begin
-        # StaticArrays skips the reflector for a zero subcolumn; the sign must not assume D-1
         R0 = zeros(4, 4, 1)
         _qr_slices_static!(R0, zeros(4, 4, 1), Val(4))
         @test det(R0[:, :, 1]) > 0
     end
 
     @testset "Float32 d=512 stays in SO(d)" begin
-        # a Float32 LU det of a large rotation underflows to +-0; check the sign in Float64
         d, P = 512, 4
         rng = Xoshiro(1)
         R = zeros(Float32, d, d, P)
@@ -127,23 +145,23 @@ isrotation(Q; atol = 1e-8) = isapprox(Q' * Q, I; atol) && isapprox(det(Q), 1; at
         bias ./= sqrt.(sum(abs2, bias; dims = 1))
         biased_rotation!(R, bias)
         @test all(p -> det(Float64.(R[:, :, p])) > 0, 1:P)
-        @test isapprox(R[:, 1, :], bias; atol = 1e-5)
+        @test R[:, 1, :] ≈ bias
     end
 
-    @testset "generic QR for non-BLAS types (BigFloat d=10)" begin
+    @testset "generic path for non-BLAS types ($T d=10)" for T in (BigFloat, Float16)
         d, P = 10, 2
-        R = zeros(BigFloat, d, d, P)
+        R = zeros(T, d, d, P)
         haar_rotations!(R, R, Xoshiro(4))
-        bias = BigFloat.(randn(Xoshiro(5), d, P))
+        bias = T.(randn(Xoshiro(5), d, P))
         bias ./= sqrt.(sum(abs2, bias; dims = 1))
         biased_rotation!(R, bias)
         for p in 1:P
-            @test isrotation(R[:, :, p])
-            @test isapprox(R[:, 1, p], bias[:, p]; atol = 1e-30)
+            @test isrotation(big.(R[:, :, p]); atol = T == Float16 ? 0.05 : 1e-30)
+            @test R[:, 1, p] ≈ bias[:, p]
         end
     end
 
-    @testset "biased rotation d=$d" for d in (2, 3, 6, 12)
+    @testset "biased rotation d=$d" for d in (2, 3, 6, 12, 200)
         P = 24
         rng = Xoshiro(21)
         R = zeros(d, d, P)
@@ -156,35 +174,45 @@ isrotation(Q; atol = 1e-8) = isapprox(Q' * Q, I; atol) && isapprox(det(Q), 1; at
         for p in 1:P
             @test isrotation(R[:, :, p])
             # column 1 must equal the bias itself, not its negation
-            @test isapprox(R[:, 1, p], bias[:, p]; atol = 1e-8)
+            @test isapprox(R[:, 1, p], bias[:, p]; atol = 1e-12)
         end
-        # column 1 is replaced by the bias, so a NaN there must not block the fix
         R[:, 1, 1] .= NaN
+        bias[1, 2] = NaN
+        bias[:, 3] .*= 0.4
+        R0 = copy(R)
         biased_rotation!(R, bias)
-        @test isrotation(R[:, :, 1])
-        @test isapprox(R[:, 1, 1], bias[:, 1]; atol = 1e-8)
+        @test isequal(R[:, :, 1:3], R0[:, :, 1:3])
     end
 
-    @testset "biased rotation sign-ambiguous case" begin
-        # R = I, bias = -e1: realign must keep column 1 = bias (not flip to +e1)
+    @testset "biased rotation with bias = $s * R[:, 1]" for s in (-1.0, 1.0)
         d = 4
         R = zeros(d, d, 1)
         R[:, :, 1] = Matrix{Float64}(I, d, d)
         bias = zeros(d, 1)
-        bias[1, 1] = -1.0
+        bias[1, 1] = s
         biased_rotation!(R, bias)
-        @test isapprox(R[:, 1, 1], bias[:, 1]; atol = 1e-12)
-        @test isrotation(R[:, :, 1])
+        @test R[:, 1, 1] == bias[:, 1]
+        @test isrotation(R[:, :, 1]; atol = 1e-15)
+    end
+
+    @testset "biased rotation normalizes a short bias" begin
+        R = zeros(12, 12, 1)
+        haar_rotations!(R, R, Xoshiro(9))
+        b = randn(Xoshiro(10), 12, 1)
+        b .*= 0.7 / norm(b)
+        biased_rotation!(R, b)
+        @test R[:, 1, 1] ≈ b[:, 1] ./ 0.7
+        @test isrotation(R[:, :, 1]; atol = 1e-12)
     end
 
     @testset "biased rotation frame is unbiased d=$d" for d in (4, 12)
-        # a fixed bias must leave columns 2..d uniform on its complement (mean 0)
         P = 20_000
         R = zeros(d, d, P)
         haar_rotations!(R, R, Xoshiro(5))
         b0 = normalize(randn(Xoshiro(6), d))
         biased_rotation!(R, repeat(b0, 1, P))
         @test maximum(j -> norm(mean(R[:, j, :]; dims = 2)), 2:d) < 0.05
+        @test maximum(abs, R[:, 2, :] * R[:, 2, :]' ./ P .- (I - b0 * b0') ./ (d - 1)) < 0.02
     end
 
     @testset "biased rotation d=1 is the identity" begin
@@ -192,12 +220,10 @@ isrotation(Q; atol = 1e-8) = isapprox(Q' * Q, I; atol) && isapprox(det(Q), 1; at
     end
 
     @testset "rotations do not depend on the thread count" begin
-        # same seeded calls in child processes with 1 and 4 threads; d=300 takes
-        # the threaded LAPACK loop, d=1 the biased early return
         script = """
         using PolyStep, Random
         open(ARGS[1], "w") do io
-            for d in (1, 5, 20, 300)
+            for d in (1, 5, 40, 300)
                 R = zeros(d, d, 4)
                 rng = Xoshiro(d)
                 haar_rotations!(R, R, rng)

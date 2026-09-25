@@ -1,5 +1,3 @@
-# Momentum and adaptive-radius dynamics (port of dynamics.py). Pure functions.
-
 """
     momentum_coefficient(iteration0, max_iterations, init, final)
 

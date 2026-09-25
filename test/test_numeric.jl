@@ -17,7 +17,6 @@ ref_lse(x) = (m = maximum(x); m + log(sum(exp.(x .- m))))
         @test splitmix64(0, 1, 2) == splitmix64(0, 1, 2)
         @test splitmix64(0, 1, 2) != splitmix64(0, 2, 1)
         @test splitmix64(42) != splitmix64(43)
-        # UInt64 seeds >= 2^63 (e.g. a nested derivation) must not throw
         @test splitmix64(splitmix64(42, 1), 2) isa UInt64
         @test splitmix64(-5, 7) == splitmix64(xor(splitmix64(reinterpret(UInt64, -5)), UInt64(7)))
     end
@@ -40,7 +39,6 @@ ref_lse(x) = (m = maximum(x); m + log(sum(exp.(x .- m))))
         Wg = similar(C)
         softmax_cols!(Wg, view(C, :, :), eps)
         @test isapprox(Wg, W; rtol = (T === Float64 ? 1e-12 : 1e-5))
-        # tiny/subnormal eps (1/eps overflows) gives the one-hot limit, not NaN
         for e in (1e-46, floatmin(Float64) / 4)
             softmax_cols!(W, C, e)
             @test W[:, 1] == (1:6 .== argmin(C[:, 1]))
@@ -69,6 +67,11 @@ ref_lse(x) = (m = maximum(x); m + log(sum(exp.(x .- m))))
         out_v2 = zeros(5)
         lse_rows!(out_v2, view(A, :, :), addp, nothing, nothing)
         @test isapprox(out_v2, out_v; rtol = 1e-12)
+        B = [-Inf 0.0 -Inf; 0.0 -Inf -Inf]
+        for Bx in (B, view(B, :, :))
+            @test lse_rows!(zeros(2), Bx, zeros(3), zeros(2), zeros(2)) == [0.0, 0.0]
+            @test lse_cols!(zeros(3), Bx, zeros(2)) == [0.0, 0.0, -Inf]
+        end
     end
 
     @testset "sanitize_cost!" begin
@@ -80,7 +83,6 @@ ref_lse(x) = (m = maximum(x); m + log(sum(exp.(x .- m))))
         @test C2 == [1e7 (2e7 + 1)]
         C3 = [1.0 2.0; 3.0 4.0]
         @test sanitize_cost!(copy(C3)) == C3
-        # near floatmax: 2*maxabs+1 would overflow, so the penalty saturates finite
         Csat = [1e308, Inf, -3.0]
         sanitize_cost!(Csat)
         @test all(isfinite, Csat)
@@ -117,14 +119,11 @@ ref_lse(x) = (m = maximum(x); m + log(sum(exp.(x .- m))))
         Zs = similar(Z)
         scale_cost!(Zs, Z, :mean)
         @test all(iszero, Zs)
-        # a constant Float16 cost must not give 0/0 (5e-11 rounds to 0 there)
         @test all(iszero, scale_cost!(similar(Z, Float16), fill(Float16(3), 2, 2), :mean))
-        # :mean divisor overflow at extreme costs falls back to the finite max
         Cbig = fill(1e308, 2, 2)
         Csb = similar(Cbig)
         scale_cost!(Csb, Cbig, :mean)
         @test all(isfinite, Csb)
-        # costs spanning +-floatmax: recentering must not overflow to NaN
         Cpm = [-1e308 1e308; 0.0 0.0]
         @test scale_cost!(similar(Cpm), Cpm, :mean) == [0.0 1.0; 0.5 0.5]
         @test scale_cost!(similar(Cpm), Cpm, :max) == [0.0 1.0; 0.5 0.5]
@@ -137,7 +136,6 @@ ref_lse(x) = (m = maximum(x); m + log(sum(exp.(x .- m))))
         normalize_particle_masses!(Wn, plan)
         @test all(isapprox(1), sum(Wn; dims = 1))
         @test isapprox(Wn, plan ./ sum(plan; dims = 1); rtol = 1e-12)
-        # zero column and a wholly-below-floor (< 1e-12) column both zero out
         plan[:, 3] .= 0
         plan[:, 2] .= 1e-15
         normalize_particle_masses!(Wn, plan)

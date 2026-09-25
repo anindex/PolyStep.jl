@@ -1,4 +1,3 @@
-# Optimization.jl adapter (OptimizationBase v5 cache-based `__solve`)
 module PolyStepOptimizationExt
 
 using PolyStep
@@ -34,10 +33,8 @@ function SciMLBase.__solve(cache::OptimizationBase.OptimizationCache{O}) where {
     (cache.solver_args.abstol === nothing && cache.solver_args.reltol === nothing) ||
         @warn "abstol/reltol are not used by PolyStepOptimizer (budget-only)" maxlog = 1
 
-    # the ES works on flat vectors; values handed back to the user get u0's shape
     shaped(x) = copyto!(similar(u0, T), x)
     flat(b) = b isa AbstractArray ? vec(b) : b
-    # cache.f is already negated for MaxSense, the user's batched f is not
     sgn = cache.sense === SciMLBase.MaxSense ? -1.0 : 1.0
     fitness(X) = batched === nothing ?
                  [Float64(first(cache.f(shaped(view(X, :, j)), cache.p))) for j in 1:size(X, 2)] :
@@ -75,7 +72,6 @@ function SciMLBase.__solve(cache::OptimizationBase.OptimizationCache{O}) where {
 
     stats = OptimizationBase.OptimizationStats(; iterations = done, time = t1 - t0,
         fevals = es.evals)
-    # budget-only: exhausting the budget is Success; no finite value returns u0
     found = isfinite(es.best_f)
     retcode = !found ? SciMLBase.ReturnCode.Failure :
               halted ? SciMLBase.ReturnCode.Terminated :

@@ -1,6 +1,3 @@
-# Quadratic model from orthoplex probe evaluations. Consumes raw per-probe losses
-# in (K, V, P) layout (V = 2d, v=i is +e_i, v=d+i is -e_i). Requires K >= 2.
-
 """
     fd_gradient!(G, losses3, scales, probe_radius) -> G
 
@@ -68,22 +65,23 @@ end
     newton_step!(N, G, H; max_step_norm=10.0, hessian_reg=1e-4) -> N
 
 Diagonal Newton step `-G ./ max(H, reg)` (curvature at/below `reg` floored,
-never an ascent step), per-particle norm clipped to `max_step_norm`.
+never an ascent step), each coordinate clamped to `+-max_step_norm`, then the
+per-particle norm clipped to `max_step_norm`.
 """
 function newton_step!(N::AbstractMatrix{T}, G::AbstractMatrix{T}, H::AbstractMatrix{T};
         max_step_norm::Real = 10.0, hessian_reg::Real = 1e-4) where {T}
     d, P = size(G)
     reg = T(hessian_reg)
+    m = T(max_step_norm)
     @inbounds for p in 1:P
         nrm2 = zero(T)
         for i in 1:d
-            Hs = H[i, p] > reg ? H[i, p] : reg
-            delta = -G[i, p] / Hs
+            delta = clamp(-G[i, p] / max(H[i, p], reg), -m, m)
             N[i, p] = delta
             nrm2 += delta * delta
         end
         nrm = max(sqrt(nrm2), T(1e-10))
-        sc = min(T(max_step_norm) / nrm, one(T))
+        sc = min(m / nrm, one(T))
         for i in 1:d
             N[i, p] *= sc
         end
@@ -92,19 +90,20 @@ function newton_step!(N::AbstractMatrix{T}, G::AbstractMatrix{T}, H::AbstractMat
 end
 
 """
-    predicted_improvement(G, H, S) -> Vector (P,)
+    predicted_improvement(G, H, S; hessian_reg=1e-4) -> Vector (P,)
 
 Quadratic-model loss change `g'delta + 0.5*delta'H delta` per particle
-(negative = improvement).
+(negative = improvement), with the curvature floored at `hessian_reg` as in `newton_step!`.
 """
 function predicted_improvement(G::AbstractMatrix{T}, H::AbstractMatrix{T},
-        S::AbstractMatrix{T}) where {T}
+        S::AbstractMatrix{T}; hessian_reg::Real = 1e-4) where {T}
     d, P = size(G)
+    reg = T(hessian_reg)
     out = Vector{T}(undef, P)
     @inbounds for p in 1:P
         acc = zero(T)
         @simd for i in 1:d
-            acc += G[i, p] * S[i, p] + T(0.5) * H[i, p] * S[i, p]^2
+            acc += G[i, p] * S[i, p] + T(0.5) * max(H[i, p], reg) * S[i, p]^2
         end
         out[p] = acc
     end
@@ -112,17 +111,19 @@ function predicted_improvement(G::AbstractMatrix{T}, H::AbstractMatrix{T},
 end
 
 """
-    predicted_improvement_mean(G, H, R, X, X0) -> Float64
+    predicted_improvement_mean(G, H, R, X, X0; hessian_reg=1e-4) -> Float64
 
 Mean over particles of the quadratic-model loss change `g's + 0.5 s'H s` for the
 realized move `X - X0`, taken in the rotated frame `s = R[:, :, p]' (X - X0)[:, p]`
-where `G`/`H` live (negative = improvement). Allocation-free companion to
-`predicted_improvement` for the trust-region ratio.
+where `G`/`H` live (negative = improvement), curvature floored at `hessian_reg`.
+Allocation-free companion to `predicted_improvement` for the trust-region ratio.
 """
 function predicted_improvement_mean(G::AbstractMatrix{T}, H::AbstractMatrix{T},
-        R::AbstractArray{T, 3}, X::AbstractMatrix{T}, X0::AbstractMatrix{T}) where {T}
+        R::AbstractArray{T, 3}, X::AbstractMatrix{T}, X0::AbstractMatrix{T};
+        hessian_reg::Real = 1e-4) where {T}
     d, P = size(G)
     P == 0 && return 0.0
+    reg = T(hessian_reg)
     acc = 0.0
     @inbounds for p in 1:P
         a = zero(T)
@@ -131,7 +132,7 @@ function predicted_improvement_mean(G::AbstractMatrix{T}, H::AbstractMatrix{T},
             @simd for j in 1:d      # R' rows = R columns
                 s += R[j, i, p] * (X[j, p] - X0[j, p])
             end
-            a += G[i, p] * s + T(0.5) * H[i, p] * s^2
+            a += G[i, p] * s + T(0.5) * max(H[i, p], reg) * s^2
         end
         acc += Float64(a)
     end
@@ -168,6 +169,7 @@ function newton_refinement!(Xout::AbstractMatrix{T}, X_bary::AbstractMatrix{T},
     newton_step!(Nbuf, G, H; max_step_norm, hessian_reg)
     _batched_matvec!(refrot, R, Nbuf)
     a = T(alpha)
+    reg = T(hessian_reg)
     copyto!(Xout, X_bary)
     @inbounds for p in 1:P
         (mask !== nothing && mask[p]) && continue
@@ -184,8 +186,9 @@ function newton_refinement!(Xout::AbstractMatrix{T}, X_bary::AbstractMatrix{T},
                 ot_i += R[j, i, p] * (X_bary[j, p] - X_current[j, p])
                 ref_i += R[j, i, p] * (Xout[j, p] - X_current[j, p])
             end
-            pred_ot += G[i, p] * ot_i + T(0.5) * H[i, p] * ot_i^2
-            pred_ref += G[i, p] * ref_i + T(0.5) * H[i, p] * ref_i^2
+            Hi = max(H[i, p], reg)
+            pred_ot += G[i, p] * ot_i + T(0.5) * Hi * ot_i^2
+            pred_ref += G[i, p] * ref_i + T(0.5) * Hi * ref_i^2
         end
         if !(pred_ref <= pred_ot)      # reject (NaN too): restore X_bary
             for j in 1:d
@@ -199,19 +202,23 @@ end
 """
     update_trust_region(pred_mean, actual, current_radius; kw...) -> Float64
 
-Predicted-vs-actual ratio update (both negative = improvement): ratio clamped
-to [-2, 5]; negative ratio -> large shrink; expand only when the model
-predicted an improvement (`pred < 0`) and reality matched.
+Predicted-vs-actual ratio update (both negative = improvement). Non-finite
+input or a predicted rise (`pred > 0`) shrinks; otherwise the ratio is clamped
+to [-2, 5], a negative ratio shrinks twice as hard, and a ratio above
+`expand_threshold` expands.
 """
 function update_trust_region(pred_mean::Real, actual::Real, current_radius::Real;
         expand_threshold::Real = 0.75, shrink_threshold::Real = 0.25,
         expand_factor::Real = 1.5, shrink_factor::Real = 0.5,
         min_radius::Real = 0.1, max_radius::Real = 3.0)
+    (isfinite(pred_mean) && isfinite(actual)) ||
+        return max(current_radius * shrink_factor, min_radius)
     abs(pred_mean) < 1e-10 && return Float64(current_radius)
+    pred_mean > 0 && return max(current_radius * shrink_factor, min_radius)
     ratio = clamp(actual / pred_mean, -2.0, 5.0)
     if ratio < 0
         return max(current_radius * shrink_factor * 0.5, min_radius)
-    elseif ratio > expand_threshold && pred_mean < 0
+    elseif ratio > expand_threshold
         return min(current_radius * expand_factor, max_radius)
     elseif ratio < shrink_threshold
         return max(current_radius * shrink_factor, min_radius)

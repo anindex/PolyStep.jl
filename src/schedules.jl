@@ -1,6 +1,3 @@
-# Epsilon schedules (port of epsilon.py). All take the 0-based iteration count;
-# `nothing` means not started and returns `init`.
-
 """
     LinearEpsilon(; target=1e-3, init=1.0, decay=0.01)
 
@@ -104,13 +101,11 @@ function _prog_setpoint(s::ProgressiveEpsilon, t::Integer)
 end
 epsilon_at(s::CosineEpsilon, ::Nothing) = s.init
 function epsilon_at(s::CosineEpsilon, t::Integer)
-    # clamped in Float64 first, so a zero decay or a huge init can't overflow Int
     T = s.total_steps > 0 ? s.total_steps :
         ceil(Int, clamp((s.init - s.target) / max(s.decay, 1e-12), 1.0, 2.0^62))
     if s.restart_mult > 1.0
         period = T
         tt = Int(t)
-        # the period grows by >= 1 per restart, so the walk always terminates
         while tt >= period
             tt -= period
             period = max(period + 1, floor(Int, min(period * s.restart_mult, 2.0^62)))

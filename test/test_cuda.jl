@@ -1,6 +1,3 @@
-# GPU tests: run with JPOLYSTEP_TEST_CUDA=1 on a CUDA-capable machine
-# (needs a clean library environment: a system CUDA on LD_LIBRARY_PATH can
-# clash with CUDA.jl artifacts).
 using CUDA
 using PolyStep: softmax_cols!, sanitize_cost!, normalize_particle_masses!,
                  _batched_mul!, _batched_matvec!, cuda_objective
@@ -43,7 +40,6 @@ using PolyStep: softmax_cols!, sanitize_cost!, normalize_particle_masses!,
     normalize_particle_masses!(Wnd, CuArray(W))
     @test isapprox(Array(Wnd), Wn; rtol = 1e-5)
 
-    # end-to-end: GPU-evaluated objective through the CPU step loop
     f_gpu(Xd) = vec(sum(abs2, Xd; dims = 1))
     es = minimize(cuda_objective(f_gpu), 6; steps = 60, epsilon = 0.05,
         step_radius = 0.3, x0 = fill(2.0, 6), rng = Xoshiro(5))

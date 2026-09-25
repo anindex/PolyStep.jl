@@ -58,7 +58,6 @@ end
     # cost-translation invariance: C + const -> same plan
     res_t = solve(s, C .+ 42.0, 0.5)
     @test isapprox(res_t.plan, res.plan; rtol = 1e-9)
-    # ... also under data-dependent scaling (:mean recenters before dividing)
     @test isapprox(solve(s, C .+ 42.0, 0.5; scale_cost = :mean).plan,
         solve(s, C, 0.5; scale_cost = :mean).plan; rtol = 1e-9)
     # scale_cost float divides
@@ -104,8 +103,9 @@ end
     # k > V falls back to all vertices
     tk_all = solve(TopKMeanSolver(k = 99), C, 0.1)
     @test all(isapprox(0.5 / 3), tk_all.plan[:, 1])
-    # non-finite costs are sanitized: never picked over a finite vertex
     @test solve(MinCostGreedySolver(), reshape([1.0, NaN, 0.5, 2.0], 4, 1)).plan == reshape([0, 0, 1.0, 0], 4, 1)
+    @test solve(MinCostGreedySolver(), fill(3.0, 4, 2)).plan == fill(0.125, 4, 2)
+    @test solve(TopKMeanSolver(k = 2), fill(3.0, 4, 2)).plan == fill(0.125, 4, 2)
     ci = reshape([3.0, 2, Inf, 0.5, 1, 4], 6, 1)
     @test solve(MinCostGreedySolver(), ci; scale_cost = :mean).plan[4, 1] == 1.0
     @test findall(>(0), vec(solve(TopKMeanSolver(k = 2), ci; scale_cost = :mean).plan)) == [4, 5]
@@ -113,7 +113,7 @@ end
 
 @testset "sinkhorn" begin
     rng = Xoshiro(12)
-    V, P = 8, 5                       # non-square: catches swapped f/g orientation
+    V, P = 8, 5
     C = randn(rng, V, P)
     s = SinkhornSolver(threshold = 1e-9, max_iterations = 5000)
     res = solve(s, C, 0.2)
@@ -128,11 +128,8 @@ end
     res_ab = solve(s, C, 0.2; a, b)
     @test isapprox(vec(sum(res_ab.plan; dims = 1)), a; atol = 1e-7)
     @test isapprox(vec(sum(res_ab.plan; dims = 2)), b; atol = 1e-7)
-    # ent_reg_cost = <f,a> + <g,b> - eps*sum(a) on the centered cost, plus the
-    # per-column centering shift (caller's cost frame)
     @test isapprox(res_ab.ent_cost, dot(res_ab.f, a) + dot(res_ab.g, b) - 0.2 * sum(a) +
                                     dot(a, vec(minimum(C; dims = 1))); rtol = 1e-10)
-    # the last iteration is always checked (max_iterations < check_every)
     r5 = solve(SinkhornSolver(max_iterations = 5, check_every = 10, threshold = 1e-3), rand(Xoshiro(1), 8, 6), 1.0)
     @test r5.converged && r5.iters == 5
     # warm start converges faster
@@ -143,9 +140,8 @@ end
     # gauge invariance: f+c, g-c yields the same plan
     shifted = solve(s, C, 0.2; a, b, f0 = cold.f .+ 5.0, g0 = cold.g .- 5.0)
     @test isapprox(shifted.plan, cold.plan; atol = 1e-6)
-    # eps-rescale heuristic path runs and still converges
-    res_rs = solve(s, C, 0.1; a, b, f0 = cold.f, g0 = cold.g, last_eps = 0.2)
-    @test res_rs.converged
+    dd = solve(SinkhornSolver(threshold = 1e-9, data_dependent_init = true), C, 0.2; a, b)
+    @test dd.converged && isapprox(dd.plan, cold.plan; atol = 1e-6)
     # non-finite warm start falls back to zeros (still converges)
     res_nf = solve(s, C, 0.2; f0 = fill(NaN, P), g0 = zeros(V))
     @test res_nf.converged
@@ -159,7 +155,6 @@ end
     # adaptive omega + anderson paths run and converge
     res_ad = solve(SinkhornSolver(threshold = 1e-9, max_iterations = 5000, adaptive_omega = true), C, 0.2)
     @test res_ad.converged
-    # adaptive omega only estimates from the unrelaxed (omega == 1) iteration
     r15 = solve(SinkhornSolver(threshold = 1e-9, max_iterations = 5000, omega = 1.5), C, 0.2)
     r15a = solve(SinkhornSolver(threshold = 1e-9, max_iterations = 5000, omega = 1.5, adaptive_omega = true), C, 0.2)
     @test r15a.plan == r15.plan && r15a.iters == r15.iters
@@ -170,10 +165,8 @@ end
     Ca = rand(Xoshiro(1), 12, 8)
     @test solve(SinkhornSolver(threshold = 1e-9, max_iterations = 5000, anderson_depth = 3), Ca, 0.05).iters <
           solve(SinkhornSolver(threshold = 1e-9, max_iterations = 5000), Ca, 0.05).iters
-    # fixed-iteration mode: finite result reports converged (ProgressiveEpsilon contract)
     res_fx = solve(SinkhornSolver(threshold = 0.0, max_iterations = 50), C, 0.2)
     @test res_fx.converged && res_fx.iters == 50
-    # omega > 1.5 divergence detector backs off and latches s.omega (threshold mode only)
     s19 = SinkhornSolver(threshold = 1e-12, max_iterations = 500, omega = 1.9)
     C19 = randn(Xoshiro(1), 8, 16)
     r19 = @test_logs (:warn, r"divergence") solve(s19, C19, 1e-3)
@@ -205,7 +198,6 @@ end
     klinf = solve(KLSoftmaxSolver(lam = Inf, threshold = 1e-10, max_iterations = 5000), C, 0.3)
     @test isapprox(vec(sum(klinf.plan; dims = 1)), fill(1 / P, P); atol = 1e-6)
     @test isapprox(vec(sum(klinf.plan; dims = 2)), fill(1 / V, V); atol = 1e-5)
-    # intermediate lam: row marginal exact, column violation between the extremes
     klmid = solve(KLSoftmaxSolver(lam = 0.3, threshold = 1e-10, max_iterations = 5000), C, 0.3)
     @test isapprox(vec(sum(klmid.plan; dims = 1)), fill(1 / P, P); atol = 1e-6)
     s0 = KLSoftmaxSolver(lam = 0.0)
@@ -215,13 +207,11 @@ end
         solve(s, C, 0.3)
     end
     @test sinf.last_marginal_violation < smid.last_marginal_violation < s0.last_marginal_violation
-    # convergence is checked every iteration, so iters is exact (not a multiple of 100)
     @test klinf.converged && klinf.iters < 100
     # generalized KL stays >= 0 when sum(a) != sum(b)
     s1 = KLSoftmaxSolver(lam = 1.0)
     solve(s1, C, 0.1; a = fill(0.01, P))
     @test s1.last_marginal_violation >= 0
-    # f is re-fit to the final g: columns carry a even on a truncated solve
     kt = solve(KLSoftmaxSolver(lam = 1.0, max_iterations = 3, threshold = 1e-12), C, 0.05)
     @test !kt.converged
     @test isapprox(vec(sum(kt.plan; dims = 1)), fill(1 / P, P); rtol = 1e-12)

@@ -28,6 +28,7 @@ CUDA = "5, 6"
 Test = "1"
 LinearAlgebra = "1.10"
 LoopVectorization = "0.12"
+Logging = "1"
 OptimizationBase = "5.2"
 Polyester = "0.7.19"
 PrecompileTools = "1"
@@ -40,8 +41,9 @@ julia = "1.10"
 [extras]
 Aqua = "4c88cf16-eb10-579e-8560-4a9242c79595"
 LoopVectorization = "bdcacae8-1622-11e9-2a5c-532679323890"
+Logging = "56ddb016-857b-54e1-b83d-db4d58db5568"
 OptimizationBase = "bca83a33-5cc9-4baa-983d-23429ab6bcbb"
 Test = "8dfed614-e22c-5e08-85e1-65c5234f0b40"
 
 [targets]
-test = ["Aqua", "LoopVectorization", "OptimizationBase", "Test"]
+test = ["Aqua", "LoopVectorization", "Logging", "OptimizationBase", "Test"]

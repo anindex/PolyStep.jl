@@ -1,9 +1,7 @@
-# Edge-case and regression tests; each testset names the behavior it pins down.
 using PolyStep: _best_finite, solve, SinkhornSolver, KLSoftmaxSolver,
                  TopKMeanSolver, SoftmaxSolver, OTResult, AbstractOTSolver,
                  normalize_particle_masses!, softmax_cols!, newton_refinement!, _diverged
 
-# stub solver producing an all-zero plan, exercises the zero-mass-column guard
 struct ZeroPlanSolver <: AbstractOTSolver end
 function PolyStep.solve(::ZeroPlanSolver, C::AbstractMatrix{T}, eps::Real;
         kwargs...) where {T}
@@ -21,7 +19,6 @@ end
     @testset "mixed NaN+finite batch updates the incumbent (core)" begin
         ps = PolyStepConfig(dim = 3)
         st = init_state(ps, randn(Xoshiro(11), 3, 4))
-        # every batch contains NaNs, but finite candidates must still win
         fn(X) = [isodd(j) ? NaN : sum(abs2, view(X, :, j)) for j in 1:size(X, 2)]
         for _ in 1:3
             PolyStep.step!(fn, ps, st; rng = Xoshiro(12))
@@ -47,7 +44,6 @@ end
         @test X1 == X2                       # bit-identical repeat runs
         @test sched.current == 0.8           # shared config never mutated
         @test sched.smoothed == 0.8
-        # invalid config: a Progressive radius schedule that never receives feedback
         @test_throws ArgumentError init_state(
             PolyStepConfig(dim = 3, solver = SinkhornSolver(),
                 epsilon = ProgressiveEpsilon(), ent_epsilon = 0.3),
@@ -63,12 +59,10 @@ end
         Wn = similar(res.plan)
         normalize_particle_masses!(Wn, res.plan)
         @test all(isfinite, Wn)
-        # at least the healthy columns must carry mass (not a global no-op)
         @test any(>(0), sum(res.plan; dims = 1))
     end
 
     @testset "KL overflow repair keeps mass on the BEST vertices" begin
-        # huge cost spread at tiny eps forces exp overflow in the plan
         C = [0.0 1e4; 1e4 0.0; 5e3 5e3]
         res = solve(KLSoftmaxSolver(lam = Inf, max_iterations = 50), C, 1e-3)
         @test all(isfinite, res.plan)
@@ -76,12 +70,18 @@ end
             best_v = argmin(view(C, :, p))
             @test argmax(view(res.plan, :, p)) == best_v
         end
+        Cx = [0.0 1e300; 1e300 0.0; 5e299 1.0]
+        for lam in (0.0, 1.0, Inf)
+            r = @test_logs solve(KLSoftmaxSolver(lam = lam, max_iterations = 50), Cx, 1e-10)
+            @test isapprox(vec(sum(r.plan; dims = 1)), [0.5, 0.5])
+            @test r.plan[1, 1] == 0.5 && all(isfinite, r.g)
+        end
     end
 
     @testset "KL warm-start NaN duals reset instead of persisting" begin
         C = randn(Xoshiro(5), 4, 6)
         res = solve(KLSoftmaxSolver(lam = 2.0, max_iterations = 100), C, 0.3;
-            f0 = fill(NaN, 6), g0 = fill(NaN, 4), last_eps = 0.3)
+            f0 = fill(NaN, 6), g0 = fill(NaN, 4))
         @test all(isfinite, res.plan)
         @test all(isfinite, res.f)
         @test all(isfinite, res.g)
@@ -90,6 +90,8 @@ end
     @testset "validation gates" begin
         @test_throws ArgumentError TopKMeanSolver(k = 0)
         @test_throws ArgumentError KLSoftmaxSolver(threshold = 0.0)   # strict test, no fixed mode
+        @test_throws ArgumentError init_state(PolyStepConfig(dim = 2,
+            ent_epsilon = ProgressiveEpsilon(), solver = KLSoftmaxSolver(lam = 0.0)), zeros(2, 2))
         @test_throws ArgumentError solve(SinkhornSolver(max_iterations = 5),
             ones(3, 4), 0.1; a = [1.0, 1.0, 1.0, 1.0], b = [0.1, 0.1, 0.1])
     end
@@ -154,7 +156,6 @@ end
         @test_throws ArgumentError PolyStepES(2; lb = [1.0, 1.0], ub = [0.0, 2.0])
         @test_throws ArgumentError PolyStepES(1; lb = Inf, ub = Inf)
         @test_throws ArgumentError PolyStepES(1; lb = -Inf, ub = -Inf)
-        # +-Inf half-bounded boxes are fine (bounds are only used through clamp)
         @test PolyStepES(2; lb = [0.0, -Inf], ub = [Inf, Inf]) isa PolyStepES
         sq1(X) = vec(sum(abs2, X .+ 1; dims = 1))      # optimum (-1, -1) outside the box
         psh = PolyStepConfig(dim = 2, lb = [0.0, -Inf], ub = Inf, max_iterations = 30)
@@ -205,9 +206,9 @@ end
         st = init_state(ps, [-1.0 1.0; 0.0 0.0; 0.0 0.0])   # particle 2 straddles the Inf wall
         step!(g, ps, st; rng = Xoshiro(1))
         pd = copy(st.prev_descent)
-        @test all(isfinite, pd[:, 1]) && !all(isfinite, pd[:, 2])
+        @test all(isfinite, pd)
         step!(g, ps, st; rng = Xoshiro(2))
-        # particle 1 is still biased toward its FD descent; particle 2 keeps a Haar draw
+        # particle 1 is still biased toward its FD descent
         @test isapprox(st.R[:, 1, 1], pd[:, 1] ./ norm(pd[:, 1]); atol = 1e-10)
         @test maximum(abs, st.R[:, :, 2]' * st.R[:, :, 2] - I(3)) < 1e-10
     end
@@ -246,13 +247,11 @@ end
     end
 
     @testset "softmax fast path stays finite at extreme cost/eps" begin
-        # |C|/eps overflows -C/eps; forming (cmin - C) first must keep it finite
         C = fill(1e308, 3, 2)
         W = similar(C)
         softmax_cols!(W, C, 1e-6)
         @test all(isfinite, W)
         @test all(isapprox(1 / 3), W)                          # equal costs -> uniform
-        # mixed huge costs: the smallest cost still gets the largest weight
         C2 = [0.0 1e300; 1e308 0.0; 1e307 1e307]
         W2 = similar(C2)
         softmax_cols!(W2, C2, 1e-3)
@@ -262,7 +261,6 @@ end
             @test argmax(view(W2, :, p)) == argmin(view(C2, :, p))
         end
         @test all(isfinite, solve(SoftmaxSolver(), fill(1e300, 4, 3), 1e-4).plan)
-        # eps = Inf is the uniform limit; 1/Inf = 0 must not turn (cmin - C) into NaN
         Wi = similar(C); softmax_cols!(Wi, C, Inf)                # fast path
         Wig = similar(C); softmax_cols!(Wig, view(C, :, :), Inf)  # generic path
         @test all(isapprox(1 / 3), Wi) && all(isapprox(1 / 3), Wig)
@@ -276,7 +274,7 @@ end
         solve!(allinf, ps, st; rng = Xoshiro(2))
         @test st.last_all_nonfinite
         @test _diverged(st)              # early-stop predicate fires
-        @test st.iteration == 1          # and breaks immediately, before min_iterations
+        @test st.iteration == 1
         @test !isfinite(st.best_f)       # no finite candidate was ever seen
     end
 
@@ -311,10 +309,8 @@ end
     end
 
     @testset "CosineEpsilon horizon (ceil) and SGDR period growth" begin
-        # ceil horizon: the default schedule reaches target at t=100, like LinearEpsilon
         @test epsilon_at(CosineEpsilon(), 99) > 1e-3
         @test epsilon_at(CosineEpsilon(), 100) == 1e-3
-        # T*mult < T+1 still grows the period (4 -> 5), and restarts never pin to target
         s = CosineEpsilon(total_steps = 4, restart_mult = 1.2)
         @test epsilon_at(s, 4) == 1.0 && epsilon_at(s, 9) == 1.0
         @test epsilon_at(s, 1000) > 0.1
@@ -382,8 +378,6 @@ end
     end
 
     @testset "Sinkhorn never leaks NaN duals when max_iterations < check_every" begin
-        # overflow (|C|/eps past floatmax) with no periodic check reachable: the
-        # terminal finite-dual guard must still hold the OTResult contract
         res = solve(SinkhornSolver(max_iterations = 5, check_every = 10),
             [-1e308 0.0; 0.0 0.0], 1e-6)
         @test all(isfinite, res.f)
@@ -396,23 +390,19 @@ end
         @test_throws ArgumentError solve(SinkhornSolver(max_iterations = 5), C, Inf)
         @test_throws ArgumentError solve(KLSoftmaxSolver(lam = 0.0), C, Inf)
         @test_throws ArgumentError solve(KLSoftmaxSolver(lam = 2.0), C, Inf)
-        # softmax legitimately handles infinite temperature -> uniform weighting
         @test all(isapprox(0.25), solve(SoftmaxSolver(), C, Inf).plan)
     end
 
     @testset "Sinkhorn/KL are numerically shift-invariant at extreme cost magnitudes" begin
-        # equal astronomical costs: uniform coupling, -C/eps must not overflow to -Inf
         C = fill(1e308, 2, 2)
         sh = solve(SinkhornSolver(max_iterations = 200), C, 1e-6)
         @test all(isfinite, sh.plan)
         @test all(isapprox(0.25), sh.plan)                         # a (x) b, uniform
         kli = solve(KLSoftmaxSolver(lam = Inf, max_iterations = 200), C, 1e-6)
         @test all(isapprox(0.25), kli.plan)
-        # KL(lam=0) == SoftmaxSolver must hold even in the overflow regime
         kl0 = solve(KLSoftmaxSolver(lam = 0.0), C, 1e-6)
         sm = solve(SoftmaxSolver(), C, 1e-6)
         @test isapprox(kl0.plan, sm.plan; rtol = 1e-10)
-        # huge spread (not just offset): the assignment coupling, worst cell -> 0
         C2 = [0.0 1e308; 1e308 0.0]
         sh2 = solve(SinkhornSolver(max_iterations = 500), C2, 1e-3)
         @test all(isfinite, sh2.plan)
@@ -424,12 +414,10 @@ end
         # total_steps = 0: iteration ignored (reactive governor)
         ep0 = ProgressiveEpsilon(init = 1.0, target = 0.01)
         @test epsilon_at(ep0, 5) == epsilon_at(ep0, 500) == 1.0
-        # total_steps > 0: decreasing cosine baseline from init to target
         ep = ProgressiveEpsilon(init = 1.0, target = 0.01, total_steps = 10)
         @test isapprox(epsilon_at(ep, 0), 1.0)
         @test isapprox(epsilon_at(ep, 10), 0.01; atol = 1e-9)
         @test epsilon_at(ep, 3) > epsilon_at(ep, 7)          # sharpens over the run
-        # feedback still modulates: a struggling solver lifts eps above the baseline
         base5 = epsilon_at(ep, 5)
         update!(ep; n_iters = 100, max_iterations = 100, converged = false)
         @test epsilon_at(ep, 5) > base5
@@ -451,8 +439,6 @@ end
     end
 
     @testset "all-non-finite batch holds the iterate (bounds active)" begin
-        # a uniform softmax over clamped candidates would drift the iterate; a
-        # failed (all non-finite) batch must instead hold every particle
         es = PolyStepES(1; x0 = [0.4], lb = -0.5, ub = 0.5, step_radius = 2.0)
         tell!(es, fill(NaN, length(ask!(es))))
         @test isapprox(es.X[1], 0.4) && es.best_f == Inf && es.evals == popsize(es)

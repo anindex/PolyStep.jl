@@ -45,8 +45,8 @@ const PY_MIXED_COORDS_R8_CAP256 = [63, 128, 55, 10]
         for (name, shapes) in PY_LAYOUTS
             layout = ParamLayout([("p$(i)" => s) for (i, s) in enumerate(shapes)])
             for ((rank, cap), dim) in PY_REFERENCE[name]
-                s = HybridSubspace(layout; rank = rank, seed = 0,
-                                   max_subspace_dim = cap == 0 ? nothing : cap)
+                s = @test_logs min_level = Logging.Error HybridSubspace(layout; rank = rank,
+                    seed = 0, max_subspace_dim = cap == 0 ? nothing : cap)
                 @test subspace_dim(s) == dim
                 @test sum(sp.ncoords for sp in s.specs) == dim
                 @test s.total_params == sum(prod(sh; init = 1) for sh in shapes)
@@ -56,11 +56,11 @@ const PY_MIXED_COORDS_R8_CAP256 = [63, 128, 55, 10]
 
     @testset "per-layer coordinate counts" begin
         dn = ParamLayout([("p$(i)" => s) for (i, s) in enumerate(DN_GNN_SHAPES)])
-        s8 = HybridSubspace(dn; rank = 8, max_subspace_dim = 512)
+        s8 = @test_logs min_level = Logging.Error HybridSubspace(dn; rank = 8, max_subspace_dim = 512)
         @test [sp.ncoords for sp in s8.specs] == PY_DN_COORDS_R8_CAP512
         @test [sp.projected for sp in s8.specs] ==
               [c < n for (c, n) in zip(PY_DN_COORDS_R8_CAP512, [sp.numel for sp in s8.specs])]
-        s1 = HybridSubspace(dn; rank = 1, max_subspace_dim = 512)
+        s1 = @test_logs min_level = Logging.Error HybridSubspace(dn; rank = 1, max_subspace_dim = 512)
         @test [sp.ncoords for sp in s1.specs] == PY_DN_COORDS_R1_CAP512
         mixed = ParamLayout([("p$(i)" => s) for (i, s) in enumerate(MIXED_SHAPES)])
         @test [sp.ncoords for sp in HybridSubspace(mixed; rank = 4, max_subspace_dim = 512).specs] ==
@@ -68,7 +68,6 @@ const PY_MIXED_COORDS_R8_CAP256 = [63, 128, 55, 10]
         @test [sp.ncoords for sp in HybridSubspace(mixed; rank = 8, max_subspace_dim = 256).specs] ==
               PY_MIXED_COORDS_R8_CAP256
         @test isapprox(compression_ratio(s1), 512 / 25857)
-        # column-major N-D: d_out is the last axis, as torch (32, 16, 3, 3)
         conv = HybridSubspace(ParamLayout(["c" => (3, 3, 16, 32)]); rank = 4)
         @test conv.specs[1].ncoords == 704
         @test conv.specs[1].projected
@@ -131,7 +130,6 @@ const PY_MIXED_COORDS_R8_CAP256 = [63, 128, 55, 10]
         s = (@test_logs (:warn,) match_mode = :any HybridSubspace(dn; rank = 8,
                                                                   max_subspace_dim = 512))
         @test subspace_dim(s) == 1287
-        # 0 is a real cap: unprojected 138 plus one per projected layer
         s0 = (@test_logs (:warn,) HybridSubspace(mixed; rank = 4, max_subspace_dim = 0))
         @test subspace_dim(s0) == 140
         @test_throws ArgumentError HybridSubspace(dn; rank = 0)

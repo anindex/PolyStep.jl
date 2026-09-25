@@ -1,0 +1,4 @@
+exdata/
+ppdata/
+.CondaPkg/
+Manifest.toml

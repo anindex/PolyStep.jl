@@ -1,6 +1,3 @@
-# CUDA extension: `cuda_objective` (one upload/download per call) and CUBLAS
-# strided-batched rotation products. Other kernels run on CuArray through the
-# broadcast fallbacks; Sinkhorn/KL solvers use scalar indexing and stay on CPU.
 module PolyStepCUDAExt
 
 using PolyStep
@@ -20,8 +17,6 @@ function PolyStep.cuda_objective(f_gpu; T::Type{<:AbstractFloat} = Float32)
     end
 end
 
-# Y[:,:,p] = A[:,:,p] * B: shared B as a size-1 batch, broadcast with stride 0
-# (batched_mul! rejects 2D x 3D)
 function PolyStep._batched_mul!(
         Y::CuArray{T, 3}, A::CuArray{T, 3}, B::CuMatrix{T}) where {T <: Union{Float32, Float64}}
     d, V, _ = size(Y)
@@ -29,7 +24,6 @@ function PolyStep._batched_mul!(
     return Y
 end
 
-# Y[:,p] = A[:,:,p] * X[:,p]: per-particle matvec as (d,1,P) batched gemm
 function PolyStep._batched_matvec!(
         Y::CuMatrix{T}, A::CuArray{T, 3}, X::CuMatrix{T}) where {T <: Union{Float32, Float64}}
     d, P = size(Y)

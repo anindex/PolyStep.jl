@@ -1,6 +1,3 @@
-# LoopVectorization extension: flag active (LV is in the test target) and
-# @turbo kernels agree with the baseline across shapes, including the odd
-# sizes where issue-#540-class miscompiles would show.
 using LoopVectorization
 using PolyStep: _TURBO_ACTIVE, _lse_cols_base!, _lse_rows_base!, lse_cols!, lse_rows!
 
@@ -22,6 +19,9 @@ using PolyStep: _TURBO_ACTIVE, _lse_cols_base!, _lse_rows_base!, lse_cols!, lse_
         lse_rows!(r2, A, addp, zeros(V), zeros(V))
         @test isapprox(r1, r2; rtol = 1e-12)
     end
+    B = [-Inf 0.0 -Inf; 0.0 -Inf -Inf]
+    @test lse_rows!(zeros(2), B, zeros(3), zeros(2), zeros(2)) == [0.0, 0.0]
+    @test lse_cols!(zeros(3), B, zeros(2)) == [0.0, 0.0, -Inf]
     A32 = randn(Xoshiro(7), Float32, 8, 21)
     o1 = zeros(Float32, 21)
     o2 = zeros(Float32, 21)

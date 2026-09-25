@@ -1,0 +1,6 @@
+[deps]
+python = ">=3.10,<3.14"
+
+[pip.deps]
+coco-experiment = ">=2.8"
+cocopp = ">=2.8"
