@@ -3,7 +3,7 @@ message: "If you use this software, please cite it as below."
 title: "PolyStep.jl: gradient-free polytope direct search for piecewise-constant objectives"
 type: software
 version: "0.2.0"
-date-released: "2026-09-25"
+date-released: "2026-09-26"
 authors:
   - family-names: "Le"
     given-names: "An T."

@@ -1,38 +1,50 @@
 # Changelog
 
-## v0.2.0 (2026-09-25)
+## v0.2.0 (2026-09-26)
 
-Seeded results change for `d > 8` and wherever behavior changed below.
+Seeded runs give different numbers than v0.1.0 for `d > 8` (new rotation sampler, same
+distribution) and wherever the behavior below changed.
 
 ### Added
 
-- `ParamLayout` and `HybridSubspace`: per-layer orthonormal subspaces for layered models,
-  matching the Python `HybridSubspace` dimensions.
-- Guide and Benchmarks docs pages; a COCO `bbob-mixint` harness in `benchmark/`.
+- `ParamLayout` and `HybridSubspace` for searching a per-layer subspace of a model's
+  parameters, with the same dimensions as the Python `HybridSubspace`.
+- A guide, a benchmarks page, and a COCO `bbob-mixint` harness in `benchmark/`.
 
 ### Changed
 
-- `scale_cost = :mean`/`:max` recenter costs before scaling; non-finite costs get
-  `2*max|finite| + 1`; `best_x`/`best_f` include the final iterate.
-- Trust region scores the quadratic model's center value and shrinks on a predicted rise;
-  curvature is floored in all predictions; Newton steps are clamped per coordinate.
-- Adaptive radius follows each particle's best vertex. Greedy solvers hold on flat costs.
-- Sinkhorn/KL: warm starts are no longer rescaled by epsilon (`last_eps` removed), the KL
-  plan is a column softmax, and `data_dependent_init` is one plain sweep.
+- `scale_cost = :mean`/`:max` subtract the minimum cost before scaling, so adding a
+  constant to the objective no longer changes a run.
+- Non-finite costs are replaced by `2*max|finite| + 1`.
+- `best_x`/`best_f` also cover the final iterate.
+- The trust region compares against the quadratic model's value at the center and
+  shrinks when the model predicts a rise.
+- The quadratic model floors its curvature everywhere, and Newton steps are clamped per
+  coordinate before the norm clip.
+- The adaptive radius follows each particle's best vertex.
+- The greedy solvers leave a particle in place when all its costs are equal.
+- Sinkhorn/KL warm starts are no longer rescaled when epsilon changes (the `last_eps`
+  keyword is gone). The KL plan is built as a column softmax, and
+  `data_dependent_init` runs one plain sweep.
 
 ### Fixed
 
-- NaN from log-sum-exp kernels on rows starting with `-Inf`.
-- FD Hessian collapse at small probe radii; Float32 rotations for `d >= 500`.
-- `ProgressiveEpsilon` drift with fixed-iteration Sinkhorn; one-pass solvers are rejected.
-- Optimization.jl extension: `MaxSense`, `maxtime`, `Failure` retcode, `u0` shape.
+- Log-sum-exp kernels returned NaN for rows starting with `-Inf`.
+- The finite-difference Hessian collapsed at small probe radii.
+- Float32 rotations for `d >= 500` were not always proper rotations.
+- `ProgressiveEpsilon` drifted with fixed-iteration Sinkhorn, and it now rejects
+  one-pass solvers.
+- Optimization.jl extension: `MaxSense`, `maxtime`, a `Failure` return code, and the
+  shape of `u0`.
 
 ### Performance
 
-- Stewart rotation sampler, pure Julia below `d = 192`: `step!` 5.6x faster at `d = 9`,
-  2.4x at `d = 100`, 1.8x at `d = 1000`; parallel runs no longer share a BLAS lock.
-- Biased rotations in O(d^2); no recompilation per objective; precompiled first call.
+- Random rotations are drawn with Stewart's method and, below `d = 192`, built in pure
+  Julia, so parallel runs no longer wait on a BLAS lock. `step!` is 5.6x faster at
+  `d = 9`, 2.4x at `d = 100` and 1.8x at `d = 1000`.
+- Biased rotations take one reflection, O(d^2).
+- `step!` no longer recompiles for each new objective, and the first call is precompiled.
 
 ## v0.1.0
 
-Initial release.
+First release.

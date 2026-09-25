@@ -10,9 +10,8 @@ const _F = Union{Float32, Float64}
 function PolyStep._lse_cols_turbo!(out::AbstractVector{T}, A::Matrix{T},
         add::AbstractVector{T}) where {T <: _F}
     V, P = size(A)
-    lo = -floatmax(T)
     @turbo for p in 1:P
-        m = lo
+        m = typemin(T)
         for v in 1:V
             m = max(m, A[v, p] + add[v])
         end
@@ -21,7 +20,8 @@ function PolyStep._lse_cols_turbo!(out::AbstractVector{T}, A::Matrix{T},
     @turbo for p in 1:P
         s = zero(T)
         for v in 1:V
-            s += exp(A[v, p] + add[v] - out[p])
+            x = A[v, p] + add[v]
+            s += exp(ifelse(x == out[p], zero(T), x - out[p]))
         end
         out[p] += log(s)
     end
@@ -34,7 +34,7 @@ function PolyStep._lse_rows_turbo!(out::AbstractVector{T}, A::Matrix{T},
         add::AbstractVector{T}, accm::Vector{T},
         accs::Vector{T}) where {T <: _F}
     V, P = size(A)
-    fill!(accm, -floatmax(T))
+    fill!(accm, typemin(T))
     fill!(accs, zero(T))
     for p in 1:P
         ap = add[p]
@@ -42,7 +42,8 @@ function PolyStep._lse_rows_turbo!(out::AbstractVector{T}, A::Matrix{T},
             x = A[v, p] + ap
             mo = accm[v]
             mn = max(x, mo)
-            accs[v] = accs[v] * exp(mo - mn) + exp(x - mn)
+            accs[v] = accs[v] * exp(ifelse(mo == mn, zero(T), mo - mn)) +
+                      exp(ifelse(x == mn, zero(T), x - mn))
             accm[v] = mn
         end
     end

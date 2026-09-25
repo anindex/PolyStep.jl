@@ -119,14 +119,15 @@ function _lse_cols_base!(out::AbstractVector{T}, A::Matrix{T},
         add::AbstractVector{T}) where {T <: AbstractFloat}
     V, P = size(A)
     @inbounds for p in 1:P
-        m = -floatmax(T)
+        m = typemin(T)
         @simd for v in 1:V
             x = A[v, p] + add[v]
             m = ifelse(x > m, x, m)
         end
         s = zero(T)
         @simd for v in 1:V
-            s += exp_fast(A[v, p] + add[v] - m)
+            x = A[v, p] + add[v]
+            s += exp_fast(ifelse(x == m, zero(T), x - m))
         end
         out[p] = m + log(s)
     end
@@ -135,8 +136,8 @@ end
 
 function lse_cols!(out::AbstractVector, A::AbstractMatrix, add::AbstractVector)
     B = A .+ add
-    m = max.(maximum(B; dims = 1), -floatmax(eltype(B)))
-    out .= vec(m .+ log.(sum(exp.(B .- m); dims = 1)))
+    m = maximum(B; dims = 1)
+    out .= vec(m .+ log.(sum(exp.(ifelse.(B .== m, zero(eltype(B)), B .- m)); dims = 1)))
     return out
 end
 
@@ -157,7 +158,7 @@ end
 function _lse_rows_base!(out::AbstractVector{T}, A::Matrix{T}, add::AbstractVector{T},
         accm::Vector{T}, accs::Vector{T}) where {T <: AbstractFloat}
     V, P = size(A)
-    fill!(accm, -floatmax(T))
+    fill!(accm, typemin(T))
     fill!(accs, zero(T))
     @inbounds for p in 1:P
         ap = add[p]
@@ -165,7 +166,8 @@ function _lse_rows_base!(out::AbstractVector{T}, A::Matrix{T}, add::AbstractVect
             x = A[v, p] + ap
             mo = accm[v]
             mn = ifelse(x > mo, x, mo)
-            accs[v] = accs[v] * exp_fast(mo - mn) + exp_fast(x - mn)
+            accs[v] = accs[v] * exp_fast(ifelse(mo == mn, zero(T), mo - mn)) +
+                      exp_fast(ifelse(x == mn, zero(T), x - mn))
             accm[v] = mn
         end
     end
@@ -177,8 +179,8 @@ end
 
 function lse_rows!(out::AbstractVector, A::AbstractMatrix, add::AbstractVector, _accm, _accs)
     B = A .+ add'
-    m = max.(maximum(B; dims = 2), -floatmax(eltype(B)))
-    out .= vec(m .+ log.(sum(exp.(B .- m); dims = 2)))
+    m = maximum(B; dims = 2)
+    out .= vec(m .+ log.(sum(exp.(ifelse.(B .== m, zero(eltype(B)), B .- m)); dims = 2)))
     return out
 end
 

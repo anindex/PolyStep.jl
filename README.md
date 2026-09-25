@@ -8,17 +8,15 @@
 [![arXiv](https://img.shields.io/badge/arXiv-2605.01928-b31b1b.svg)](https://arxiv.org/abs/2605.01928)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
-Gradient-free direct search for black-box objectives that are piecewise constant or
-non-differentiable: simulation optimization, decision-focused learning, and pipelines
-through combinatorial solvers. It is the Julia implementation of
-[PolyStep](https://github.com/anindex/polystep)
-([TMLR 2026](https://arxiv.org/abs/2605.01928)).
+PolyStep.jl minimizes black-box functions that give you no useful gradient: losses that
+are piecewise constant, pass through an argmax or a combinatorial solver, or come out of
+an integer-valued simulation. It is the Julia version of
+[PolyStep](https://github.com/anindex/polystep) ([TMLR 2026](https://arxiv.org/abs/2605.01928)).
 
-Each step places a randomly rotated polytope around every particle, evaluates all
-vertices in one batched call, weights them by `softmax(-C/epsilon)` or an entropic
-transport plan, and moves to the weighted barycenter. The finite radius lets a step
-cross the flat pieces of a loss whose gradient is zero almost everywhere. Results are
-bit-identical for any thread count.
+Each step puts a randomly rotated polytope around the current point, evaluates all of
+its vertices in one batched call, and moves to a softmax-weighted average of them. The
+vertices sit a finite distance away, so a step can see across flat regions where the
+gradient is zero. The same seed gives bit-identical results on any number of threads.
 
 [Paper](https://arxiv.org/abs/2605.01928) ·
 [Interactive visualization](https://vietngth.github.io/polystep-visualization/) ·
@@ -71,44 +69,49 @@ println((best_x = es.best_x, best_f = es.best_f))
 # (best_x = [3.0, 3.0, 3.0, 3.0, 3.0], best_f = 0.7999999999999996)
 ```
 
-`PolyStepConfig` / `step!` / `solve!` expose the full feature set (Sinkhorn and other
-OT solvers, epsilon schedules, momentum, adaptive radius, biased rotations, a
-finite-difference quadratic model with Newton refinement and a trust region), and
-`PolyStepOptimizer` plugs into [Optimization.jl](https://github.com/SciML/Optimization.jl).
-See the [guide](https://anindex.github.io/PolyStep.jl/stable/guide/) for tuning,
-bounds, threading and subspaces.
+For more control, `PolyStepConfig` with `step!`/`solve!` adds Sinkhorn and other OT
+solvers, epsilon schedules, momentum, an adaptive radius, biased rotations, and a
+quadratic model with Newton refinement and a trust region. `PolyStepOptimizer` plugs
+into [Optimization.jl](https://github.com/SciML/Optimization.jl). The
+[guide](https://anindex.github.io/PolyStep.jl/stable/guide/) covers tuning, bounds,
+threads and subspaces.
 
 ## When to use it
 
-- **Good fit:** the loss goes through argmax routing, a combinatorial solver or an
-  integer-valued simulation; evaluations are cheap and batchable; runs must
-  reproduce bit for bit at any thread count.
-- **Use something else when:** evaluations take minutes (Bayesian optimization); the
-  problem is smooth or low dimensional (CMA-ES, or Nelder-Mead, which solves example 02
-  in 106 evaluations); a usable gradient or surrogate exists (in example 04 a
-  Fenchel-Young loss needs about 200x fewer solver calls); you need proven convergence
-  with native integer variables (NOMAD).
+Use it when the loss goes through argmax routing, a combinatorial solver or an
+integer-valued simulation, and a batch of evaluations is cheap.
+
+Reach for something else when one evaluation takes minutes (Bayesian optimization), when
+the problem is smooth and small (CMA-ES is usually better, and Nelder-Mead solves
+example 02 in 106 evaluations), or when a usable gradient or surrogate exists: in
+example 04 a Fenchel-Young loss needs about 200x fewer solver calls. For convergence
+guarantees with native integer variables, try NOMAD.
 
 ## Examples
 
-Runnable scripts, each with a printed table and a pass/fail assertion. Every method gets
-the same evaluation budget and an equal-size tuning grid selected on the training
-objective only (grids in the script headers). CMA-ES is IPOP-CMA-ES with restarts
-([ipop_cma.jl](examples/ipop_cma.jl)). Run `julia --project=examples -e 'using Pkg;
-Pkg.instantiate()'` once, then `julia --project=examples examples/<script>.jl`.
+Each script prints a results table and asserts its claim. All methods get the same
+evaluation budget and a tuning grid of the same size, chosen on training data only; the
+grids are in the script headers. "CMA-ES" means IPOP-CMA-ES with restarts
+([ipop_cma.jl](examples/ipop_cma.jl)).
+
+```sh
+julia --project=examples -e 'using Pkg; Pkg.instantiate()'
+julia --project=examples examples/01_hard_decision_tree.jl
+```
 
 | # | Problem | Result |
 |---|---|---|
 | [01](examples/01_hard_decision_tree.jl) | Hard oblique decision tree, 0-1 loss, 20 checkerboards, 40k evals | Median train/test accuracy: PolyStep 94.2/90.9%, IPOP-CMA-ES 87.7/83.3%, OpenAI-ES 85.4/80.8%, SPSA 84.6/80.4%. PolyStep has the higher test accuracy on 16-19 of 20 instances. |
-| [02](examples/02_inventory_sS.jl) | (s,S) inventory policy, 2-D, Poisson demand, 5 seeds | Tie: PolyStep, IPOP-CMA-ES and Nelder-Mead reach the grid optimum. SPSA trails at a 500-eval budget. |
-| [03](examples/03_districting_cmst.jl) | Contextual districting through a capacitated-MST decoder, 8000 decoder calls, 5 seeds | Tie: PolyStep 9.549, perturbed gradient + Adam 9.554, IPOP-CMA-ES 9.584 (true-cost decode 9.674); means within 0.4%. |
-| [04](examples/04_dfl_benchmarks.jl) | Decision-focused subset selection (DecisionFocusedLearningBenchmarks), 625 weights, hard top-k, 3 seeds | Test regret: PolyStep 2.27, Fenchel-Young 3.51, IPOP-CMA-ES 4.02 (untrained 6.51), lowest on every seed, at about 200x more solver calls than Fenchel-Young. |
-| [05](examples/05_predicted_weights_knapsack.jl) | DFL with predicted knapsack weights, 10 seeds, 12k evals | Lowest median train regret (0.229 vs CMA-ES 0.302); median test regret 4.74 vs CMA-ES 4.67 and SFGE 4.90, within seed noise. |
+| [02](examples/02_inventory_sS.jl) | (s,S) inventory policy, 2-D, Poisson demand, 5 seeds | PolyStep, IPOP-CMA-ES and Nelder-Mead all reach the grid optimum. SPSA falls behind at a 500-eval budget. |
+| [03](examples/03_districting_cmst.jl) | Contextual districting through a capacitated-MST decoder, 8000 decoder calls, 5 seeds | PolyStep 9.549, perturbed gradient + Adam 9.554, IPOP-CMA-ES 9.584; all beat the true-cost decode (9.674) and sit within 0.4% of each other. |
+| [04](examples/04_dfl_benchmarks.jl) | Decision-focused subset selection (DecisionFocusedLearningBenchmarks), 625 weights, hard top-k, 3 seeds | Test regret: PolyStep 2.27, Fenchel-Young 3.51, IPOP-CMA-ES 4.02 (untrained 6.51). PolyStep is lowest on every seed but uses about 200x more solver calls than Fenchel-Young. |
+| [05](examples/05_predicted_weights_knapsack.jl) | DFL with predicted knapsack weights, 10 seeds, 12k evals | PolyStep has the lowest median train regret (0.229 vs CMA-ES 0.302). On test it is 4.74 vs CMA-ES 4.67 and SFGE 4.90, which is within seed noise. |
 
-On the COCO `bbob-mixint` suite (mixed-integer, dimensions 5 and 10) PolyStep solves
-about as many targets as CMA-ES with margin, leads at budgets up to `1000 * dim`, and
-trails pycma at `10^4 * dim` in dimension 10
-([benchmarks](https://anindex.github.io/PolyStep.jl/stable/benchmarks/)).
+We also ran the COCO `bbob-mixint` suite, where 80% of the variables are integers. In
+dimensions 5 and 10, PolyStep keeps up with CMA-ES with margin and is ahead up to
+`1000 * dim` evaluations; with the full `10^4 * dim` budget, pycma does better in
+dimension 10. Details are on the
+[benchmarks page](https://anindex.github.io/PolyStep.jl/stable/benchmarks/).
 
 ## Maintainers
 
