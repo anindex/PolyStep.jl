@@ -20,30 +20,29 @@ function SinkhornWorkspace{T}(V::Int, P::Int) where {T}
 end
 
 """
-    SinkhornSolver(; max_iterations=2000, threshold=1e-6, check_every=10,
+    SinkhornSolver(; max_iterations=2000, threshold=3e-5, check_every=10,
                    omega=1.0, anderson_depth=0, adaptive_omega=false,
                    data_dependent_init=false)
 
-Entropic OT: `min_P <C,P> + eps*KL(P || a(x)b)` s.t. `P1=a, P'1=b, P>=0`,
-solved by log-domain alternating (Gauss-Seidel) dual updates with optional
-successive overrelaxation `omega in [0.5, 1.95]`, warm-started duals,
-Anderson acceleration (Tikhonov-regularized, accepted only when it improves the
-Lyapunov dual), the Lehmann residual-ratio adaptive omega (estimated only while
-omega == 1, as in Python), and a latched divergence detector for `omega > 1.5`.
-`threshold <= 0` selects fixed-iteration mode (single terminal finite check; a
-finite result reports `converged=true`, which ProgressiveEpsilon needs).
-`ent_cost` is the dual value in the caller's (sanitized, scaled) cost frame.
+Entropic OT on the `(V, P)` cost: `min_P <C,P> + eps*sum(P .* (log.(P) .- 1))`
+with vertex marginal `b` (row sums) and particle marginal `a` (column sums),
+solved by log-domain alternating dual updates with optional overrelaxation
+`omega in [0.5, 1.95]`, warm-started duals, Anderson acceleration (accepted only
+when it raises the dual), the residual-ratio adaptive omega (estimated while
+`omega == 1`), and a divergence back-off for `omega > 1.5`. It stops when the
+relative marginal error `max|expm1(log(P'1) - log(a))|` drops below `threshold`,
+or unconverged once the error stalls at the dtype's precision. `threshold <= 0`
+runs a fixed number of iterations and reports `converged` when the result is
+finite. Zero-mass entries of `a`/`b` get zero mass and `-Inf` duals. `ent_cost` is the
+dual value in the sanitized, scaled cost frame.
 
-Solver instances hold per-call scratch (workspace, warn latches) and are
-single-run-per-instance: never share one across concurrent optimizations.
-
-The `solve` body uses scalar-indexed convergence and plan-repair loops, so it is
-a CPU path (not safe under `CUDA.allowscalar(false)`). GPU objectives reach OT
-through the softmax kernels and `cuda_objective`, not through `SinkhornSolver`.
+An instance keeps a workspace between calls: do not call `solve` on one instance
+from two tasks at once (`init_state` and `PolyStepES` copy the solver). The
+solve is a CPU path.
 """
 Base.@kwdef mutable struct SinkhornSolver <: AbstractOTSolver
     max_iterations::Int = 2000
-    threshold::Float64 = 1e-6
+    threshold::Float64 = 3e-5
     check_every::Int = 10
     omega::Float64 = 1.0
     anderson_depth::Int = 0
@@ -79,8 +78,8 @@ function _align_dual(init, n::Integer, ::Type{T}, name::String) where {T}
     return convert(Vector{T}, collect(init))
 end
 
-function _dual_objective(f::Vector{T}, g::Vector{T}, logK::Matrix{T}, am, bm, epsT::T,
-        tmpP::Vector{T}, gdiv::Vector{T}) where {T}
+function _dual_objective(f::AbstractVector{T}, g::AbstractVector{T}, logK::AbstractMatrix{T},
+        am, bm, epsT::T, tmpP::AbstractVector{T}, gdiv::AbstractVector{T}) where {T}
     @. gdiv = g / epsT
     lse_cols!(tmpP, logK, gdiv)
     @. tmpP += f / epsT
@@ -114,37 +113,31 @@ function solve(s::SinkhornSolver, C::AbstractMatrix{T}, eps::Real;
     V, P = size(C)
     (V == 0 || P == 0) &&
         throw(ArgumentError("Sinkhorn received an empty cost matrix (V=$V, P=$P)"))
-    # CPU path reuses the workspace; generic/GPU arrays allocate
+    epsT = T(eps)
+    (isfinite(epsT) && epsT > 0) || throw(ArgumentError("epsilon $eps is not representable in $T"))
     ws = C isa Matrix{T} ? _sinkhorn_ws(s, T, V, P) : nothing
-    Cs = if ws === nothing
-        _prepare_cost(C, scale_cost)
-    else
-        copyto!(ws.Cs, C)
-        sanitize_cost!(ws.Cs)
-        scale_cost === nothing || scale_cost!(ws.Cs, ws.Cs, scale_cost)
-        ws.Cs
-    end
+    Cs = ws === nothing ? _prepare_cost(C, scale_cost) : _prepare_cost!(ws.Cs, C, scale_cost)
     am = _align_marginal(a, P, Cs, "a")
-    shift = dot(am, vec(minimum(Cs; dims = 1)))   # added back to ent_cost
-    center_cols!(Cs)
     bm = _align_marginal(b, V, Cs, "b")
     tot_a, tot_b = sum(am), sum(bm)
     abs(tot_a - tot_b) <= sqrt(Base.eps(T)) * max(tot_a, tot_b) ||
         throw(ArgumentError("Sinkhorn marginals must have equal total mass; got sum(a)=$tot_a, sum(b)=$tot_b"))
-    epsT = T(eps)
+    (any(iszero, am) || any(iszero, bm)) && return _solve_on_support(s, Cs, eps, am, bm, f0, g0)
+    shift = dot(am, vec(minimum(Cs; dims = 1)))
+    center_cols!(Cs)
 
     local logK, log_a, log_b
     if ws === nothing
         logK = Cs ./ (-epsT)
-        log_a = log.(max.(am, T(1e-30)))
-        log_b = log.(max.(bm, T(1e-30)))
+        log_a = log.(am)
+        log_b = log.(bm)
     else
         logK = ws.logK
         @. logK = Cs / (-epsT)
         log_a = ws.log_a
-        @. log_a = log(max(am, T(1e-30)))
+        @. log_a = log(am)
         log_b = ws.log_b
-        @. log_b = log(max(bm, T(1e-30)))
+        @. log_b = log(bm)
     end
 
     local ftmp, gtmp, fdiv, gdiv, accm, accs
@@ -201,6 +194,7 @@ function solve(s::SinkhornSolver, C::AbstractMatrix{T}, eps::Real;
     end
 
     converged = false
+    dual_reset = false
     n_iters = 0
     errors = Float64[]
     omega = s.omega
@@ -215,6 +209,7 @@ function solve(s::SinkhornSolver, C::AbstractMatrix{T}, eps::Real;
         if !(all(isfinite, f) && all(isfinite, g))
             fill!(f, zero(T))
             fill!(g, zero(T))
+            dual_reset = true
         else
             converged = true
         end
@@ -292,19 +287,22 @@ function solve(s::SinkhornSolver, C::AbstractMatrix{T}, eps::Real;
                 if !(all(isfinite, f) && all(isfinite, g))
                     fill!(f, zero(T))
                     fill!(g, zero(T))
+                    dual_reset = true
                     break
                 end
                 gdiv .= g ./ epsT
                 lse_cols!(ftmp, logK, gdiv)
                 marg_a_err = zero(T)
                 @inbounds for p in 1:P
-                    marg_a_err = max(marg_a_err, abs(exp_fast(f[p] / epsT + ftmp[p]) - am[p]))
+                    marg_a_err = max(marg_a_err, abs(expm1(f[p] / epsT + ftmp[p] - log_a[p])))
                 end
-                fdiv .= f ./ epsT
-                lse_rows!(gtmp, logK, fdiv, accm, accs)
                 marg_b_err = zero(T)
-                @inbounds for v in 1:V
-                    marg_b_err = max(marg_b_err, abs(exp_fast(g[v] / epsT + gtmp[v]) - bm[v]))
+                if omega != 1 || s.anderson_depth > 0 || s.adaptive_omega
+                    fdiv .= f ./ epsT
+                    lse_rows!(gtmp, logK, fdiv, accm, accs)
+                    @inbounds for v in 1:V
+                        marg_b_err = max(marg_b_err, abs(expm1(g[v] / epsT + gtmp[v] - log_b[v])))
+                    end
                 end
                 err = Float64(max(marg_a_err, marg_b_err))
                 omega_old = omega
@@ -347,12 +345,17 @@ function solve(s::SinkhornSolver, C::AbstractMatrix{T}, eps::Real;
                     converged = true
                     break
                 end
+                n = length(errors)
+                if n > 3 && minimum(@view errors[(n - 2):n]) >= minimum(@view errors[1:(n - 3)])
+                    dmax = Float64(_maxabs(f) + _maxabs(g))
+                    stall = 2 * Base.eps(T) * ((dmax + min(dmax, Float64(cost_scale))) / epsT + 1)
+                    err < stall && break
+                end
             end
         end
     end
 
-    ent_reg_cost = Float64(dot(f, am) + dot(g, bm) - epsT * sum(am) + shift)
-    # logK is dead past the loop; reuse it as log-plan scratch
+    ent_reg_cost = Float64(_dual_objective(f, g, logK, am, bm, epsT, ftmp, gdiv) + shift)
     logP = ws === nothing ? ((f' .+ g .- Cs) ./ epsT) : (@. ws.logK = (f' + g - Cs) / epsT)
     plan = exp.(logP)
     @inbounds for p in 1:P
@@ -363,11 +366,19 @@ function solve(s::SinkhornSolver, C::AbstractMatrix{T}, eps::Real;
             colfinite &= isfinite(x)
             colmass += x
         end
-        if !colfinite || colmass == 0
+        if dual_reset && colfinite && colmass > 0
+            for v in 1:V
+                plan[v, p] *= am[p] / colmass
+            end
+        elseif !colfinite || colmass == 0
             m = maximum(view(logP, :, p))
             if isfinite(m)
+                z = zero(T)
                 for v in 1:V
-                    plan[v, p] = exp_fast(logP[v, p] - m)
+                    z += exp_fast(logP[v, p] - m)
+                end
+                for v in 1:V
+                    plan[v, p] = am[p] * (exp_fast(logP[v, p] - m) / z)
                 end
             else
                 for v in 1:V
@@ -375,6 +386,12 @@ function solve(s::SinkhornSolver, C::AbstractMatrix{T}, eps::Real;
                 end
             end
         end
+    end
+    if converged && !fixed_mode
+        tol = max(2 * s.threshold, sqrt(Base.eps(T)))
+        colerr = maximum(p -> abs(sum(view(plan, :, p)) / am[p] - 1), 1:P)
+        rowerr = maximum(v -> abs(sum(view(plan, v, :)) / bm[v] - 1), 1:V)
+        converged = max(colerr, rowerr) <= tol
     end
     return OTResult(plan, ent_reg_cost, f, g, converged, n_iters,
         isempty(errors) ? nothing : errors)

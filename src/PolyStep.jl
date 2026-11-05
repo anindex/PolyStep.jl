@@ -30,7 +30,7 @@ export orthoplex_vertices, simplex_vertices, cube_vertices, polytope_vertices, n
 export haar_rotations!, biased_rotation!, probe_scales
 export splitmix64
 export LinearEpsilon, CosineEpsilon, ProgressiveEpsilon, epsilon_at, update!
-export SoftmaxSolver, TemperedSoftmaxSolver, KLSoftmaxSolver, SinkhornSolver,
+export SoftmaxSolver, KLSoftmaxSolver, SinkhornSolver,
        MinCostGreedySolver, TopKMeanSolver, OTResult
 export PolyStepConfig, PolyStepState, init_state, step!, solve!, columnwise
 export PolyStepES, ask!, tell!, minimize, popsize, PolyStepOptimizer

@@ -1,4 +1,4 @@
-using PolyStep: solve, OTResult, SoftmaxSolver, TemperedSoftmaxSolver, KLSoftmaxSolver,
+using PolyStep: solve, OTResult, SoftmaxSolver, KLSoftmaxSolver,
                  SinkhornSolver, MinCostGreedySolver, TopKMeanSolver,
                  LinearEpsilon, CosineEpsilon, ProgressiveEpsilon, epsilon_at, update!, is_scheduled
 
@@ -80,18 +80,6 @@ end
     @test_throws ArgumentError solve(s, C, 0.5; a = fill(-1.0, P))
 end
 
-@testset "tempered softmax ignores eps" begin
-    rng = Xoshiro(11)
-    C = randn(rng, 4, 5)
-    ts = TemperedSoftmaxSolver(tau = 0.7)
-    r1 = solve(ts, C, 0.001)
-    r2 = solve(ts, C, 100.0)
-    @test r1.plan == r2.plan                     # eps argument must not matter
-    ref = solve(SoftmaxSolver(), C, 0.7)
-    @test isapprox(r1.plan, ref.plan; rtol = 1e-12)  # equals softmax at eps=tau
-    @test_throws ArgumentError solve(TemperedSoftmaxSolver(tau = 0.0), C, 1.0)
-end
-
 @testset "greedy solvers" begin
     C = [1.0 5.0; 3.0 2.0; 2.0 2.0]   # V=3, P=2; column 2 has tie at rows 2,3
     g = solve(MinCostGreedySolver(), C, 0.1)
@@ -106,6 +94,10 @@ end
     @test solve(MinCostGreedySolver(), reshape([1.0, NaN, 0.5, 2.0], 4, 1)).plan == reshape([0, 0, 1.0, 0], 4, 1)
     @test solve(MinCostGreedySolver(), fill(3.0, 4, 2)).plan == fill(0.125, 4, 2)
     @test solve(TopKMeanSolver(k = 2), fill(3.0, 4, 2)).plan == fill(0.125, 4, 2)
+    @test vec(solve(TopKMeanSolver(k = 3), reshape([1, 2, Inf, NaN, -Inf], 5, 1)).plan) ==
+          [0.5, 0.5, 0, 0, 0]
+    @test vec(solve(TopKMeanSolver(k = 3), fill(Inf, 4, 1)).plan) == fill(0.25, 4)
+    @test vec(solve(MinCostGreedySolver(), reshape([Inf, floatmax(Float64)], 2, 1)).plan) == [0, 1]
     ci = reshape([3.0, 2, Inf, 0.5, 1, 4], 6, 1)
     @test solve(MinCostGreedySolver(), ci; scale_cost = :mean).plan[4, 1] == 1.0
     @test findall(>(0), vec(solve(TopKMeanSolver(k = 2), ci; scale_cost = :mean).plan)) == [4, 5]
@@ -128,7 +120,9 @@ end
     res_ab = solve(s, C, 0.2; a, b)
     @test isapprox(vec(sum(res_ab.plan; dims = 1)), a; atol = 1e-7)
     @test isapprox(vec(sum(res_ab.plan; dims = 2)), b; atol = 1e-7)
-    @test isapprox(res_ab.ent_cost, dot(res_ab.f, a) + dot(res_ab.g, b) - 0.2 * sum(a) +
+    Cc = C .- minimum(C; dims = 1)
+    @test isapprox(res_ab.ent_cost, dot(res_ab.f, a) + dot(res_ab.g, b) -
+                                    0.2 * sum(exp.((res_ab.f' .+ res_ab.g .- Cc) ./ 0.2)) +
                                     dot(a, vec(minimum(C; dims = 1))); rtol = 1e-10)
     r5 = solve(SinkhornSolver(max_iterations = 5, check_every = 10, threshold = 1e-3), rand(Xoshiro(1), 8, 6), 1.0)
     @test r5.converged && r5.iters == 5
@@ -218,4 +212,59 @@ end
     # ent_cost is the transport cost <C,P> in the caller's frame
     @test isapprox(klmid.ent_cost, dot(C, klmid.plan); rtol = 1e-10)
     @test_throws ArgumentError KLSoftmaxSolver(lam = -1.0)
+end
+
+@testset "solver stop rules, marginal support and repair" begin
+    C = [((v * 37 + p * 91 + v * p) % 101) / 101 for v in 1:20, p in 1:1000]
+    r = solve(SinkhornSolver(), C, 1e-2)
+    @test r.converged
+    @test maximum(abs.(vec(sum(r.plan; dims = 1)) .* 1000 .- 1)) <= 3.001e-5
+    stall = solve(SinkhornSolver(max_iterations = 20_000), 1000 .* rand(Xoshiro(1), Float32, 20, 8), 1.0)
+    @test !stall.converged && stall.iters < 20_000
+    for S in (SinkhornSolver(), KLSoftmaxSolver())
+        @test_throws ArgumentError solve(S, rand(Float32, 4, 3), 1e-46)
+    end
+    tiny = solve(SinkhornSolver(threshold = 1e-9), zeros(2, 2), 1.0; a = [1e-100, 1.0], b = [0.5, 0.5])
+    @test isapprox(sum(tiny.plan[:, 1]), 1e-100; rtol = 1e-6)
+    z = solve(SinkhornSolver(), rand(Xoshiro(2), 3, 4), 0.5; a = [0, 0.5, 0.25, 0.25], b = [0.5, 0, 0.5])
+    @test all(iszero, z.plan[:, 1]) && all(iszero, z.plan[2, :]) && z.f[1] == -Inf
+    @test isapprox(vec(sum(z.plan; dims = 1)), [0, 0.5, 0.25, 0.25]; atol = 1e-4)
+    kz = KLSoftmaxSolver(lam = 1.0)
+    @test all(iszero, solve(kz, [-100.0 -100.0; 0.0 0.0], 1.0; b = [0.0, 1.0]).plan[1, :])
+    for lam in (0.05, 0.005)
+        k = KLSoftmaxSolver(lam = lam)
+        rk = solve(k, rand(Xoshiro(3), 6, 4), 0.5; b = [0, 0.25, 0.25, 0.25, 0.25, 0])
+        @test all(iszero, rk.plan[[1, 6], :]) && isfinite(k.last_marginal_violation)
+    end
+    Cb = [0.0 0.0; 1e300 1e300; 1.0 2.0]
+    for S in (SinkhornSolver(), KLSoftmaxSolver())
+        rb = solve(S, Cb, 1e-10)
+        @test all(isfinite, rb.plan) && isapprox(vec(sum(rb.plan; dims = 1)), [0.5, 0.5]; rtol = 1e-6)
+    end
+    Cr = rand(Xoshiro(4), 20, 8)
+    for T in (Float64, Float32)
+        its = [begin
+                   rr = solve(KLSoftmaxSolver(lam = sc), T.(sc .* Cr), 0.1 * sc)
+                   @test rr.converged
+                   rr.iters
+               end
+               for sc in (1, 1e3, 1e5)]
+        @test maximum(its) - minimum(its) <= 1
+    end
+    rs = solve(KLSoftmaxSolver(), rand(Xoshiro(3), 7, 9), 1e-2)
+    @test rs.converged
+    @test maximum(abs.(vec(sum(rs.plan; dims = 2)) .* 7 .- 1)) < 1e-3
+    k = solve(KLSoftmaxSolver(threshold = 1e-9, max_iterations = 20_000),
+        1000 .* rand(Xoshiro(1), Float32, 20, 8), 1.0)
+    @test !k.converged && k.iters < 20_000
+    for S in (SinkhornSolver(), KLSoftmaxSolver())
+        @test_throws ArgumentError solve(S, Float32[0 1; 1 0; 2 3], 1e39)
+    end
+    @test solve(KLSoftmaxSolver(lam = 1e17), rand(Xoshiro(5), 4, 3), 0.1;
+        a = fill(1 / 3, 3), b = fill(1.0, 4)).plan isa Matrix
+    @test_throws ArgumentError solve(KLSoftmaxSolver(), rand(Float32, 4, 3), 0.1; a = fill(1e-50, 3))
+    @test !solve(SinkhornSolver(), reshape(Float32[0, 1f8], 2, 1), 1.0f0).converged
+    d1 = solve(SinkhornSolver(threshold = 0.0, max_iterations = 1, omega = 0.5), [0.0 2.0; 3.0 0.0], 0.3)
+    @test isapprox(d1.ent_cost, sum(d1.f) / 2 + sum(d1.g) / 2 -
+                                0.3 * sum(exp.((d1.f' .+ d1.g .- [0.0 2.0; 3.0 0.0]) ./ 0.3)); rtol = 1e-12)
 end

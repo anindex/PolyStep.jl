@@ -36,16 +36,12 @@ function PolyStep._lse_rows_turbo!(out::AbstractVector{T}, A::Matrix{T},
     V, P = size(A)
     fill!(accm, typemin(T))
     fill!(accs, zero(T))
-    for p in 1:P
-        ap = add[p]
-        @turbo for v in 1:V
-            x = A[v, p] + ap
-            mo = accm[v]
-            mn = max(x, mo)
-            accs[v] = accs[v] * exp(ifelse(mo == mn, zero(T), mo - mn)) +
-                      exp(ifelse(x == mn, zero(T), x - mn))
-            accm[v] = mn
-        end
+    @turbo for p in 1:P, v in 1:V
+        accm[v] = max(accm[v], A[v, p] + add[p])
+    end
+    @turbo for p in 1:P, v in 1:V
+        x = A[v, p] + add[p]
+        accs[v] += exp(ifelse(x == accm[v], zero(T), x - accm[v]))
     end
     @turbo for v in 1:V
         out[v] = accm[v] + log(accs[v])

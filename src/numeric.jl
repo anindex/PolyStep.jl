@@ -28,17 +28,12 @@ function splitmix64(seed::Integer, extras::Integer...)
     return z
 end
 
-function _best_finite(x::AbstractVector)
-    bf = Inf
+function _best_finite(x::AbstractArray)
     bidx = 0
     @inbounds for j in eachindex(x)
-        v = Float64(x[j])
-        if isfinite(v) && v < bf
-            bf = v
-            bidx = j
-        end
+        isfinite(x[j]) && (bidx == 0 || x[j] < x[bidx]) && (bidx = j)
     end
-    return bf, bidx
+    return bidx == 0 ? Inf : Float64(x[bidx]), bidx
 end
 
 const _KERNEL_BATCH_MIN = 1024
@@ -144,10 +139,10 @@ end
 """
     lse_rows!(out, A, add, accm, accs) -> out
 
-`out[v] = log(sum_p(exp(A[v, p] + add[p])))`: the strided direction, computed
-with an online-logsumexp accumulator pair (`accm` running max, `accs` running
-sum, both length V) so every read of `A` is contiguous. This is why the (V, P)
-layout serves both Sinkhorn update directions without a transposed copy.
+`out[v] = log(sum_p(exp(A[v, p] + add[p])))`: the strided direction, computed in
+two column sweeps (row maxima into `accm`, then shifted sums into `accs`, both
+length V), so every read of `A` is contiguous and the (V, P) layout serves both
+Sinkhorn updates without a transposed copy.
 """
 function lse_rows!(out::AbstractVector{T}, A::Matrix{T}, add::AbstractVector{T},
         accm::Vector{T}, accs::Vector{T}) where {T <: AbstractFloat}
@@ -164,11 +159,15 @@ function _lse_rows_base!(out::AbstractVector{T}, A::Matrix{T}, add::AbstractVect
         ap = add[p]
         @simd for v in 1:V
             x = A[v, p] + ap
-            mo = accm[v]
-            mn = ifelse(x > mo, x, mo)
-            accs[v] = accs[v] * exp_fast(ifelse(mo == mn, zero(T), mo - mn)) +
-                      exp_fast(ifelse(x == mn, zero(T), x - mn))
-            accm[v] = mn
+            accm[v] = ifelse(x > accm[v], x, accm[v])
+        end
+    end
+    @inbounds for p in 1:P
+        ap = add[p]
+        @simd for v in 1:V
+            x = A[v, p] + ap
+            m = accm[v]
+            accs[v] += exp_fast(ifelse(x == m, zero(T), x - m))
         end
     end
     @inbounds for v in 1:V
@@ -227,35 +226,41 @@ end
 """
     scale_cost!(Cs, C, spec) -> Cs
 
-Write the scaled solver input `Cs` from the raw (sanitized) cost `C`.
-`spec`: `nothing` (copy), `:mean` (`(C - m) / mean(C - m)`), `:max`
-(`(C - m) / (max(C) - m)`), with `m = minimum(C)` and the divisor floored at
-`1e-10`, or a finite positive real divisor (`C / s`, no recentering).
-Recentering first makes `:mean`/`:max` shift-invariant, as in the Python
-reference: the temperature follows the spread of the costs, not their level.
-A negative divisor would reverse the objective (rejected).
+Write the scaled solver input `Cs` from the raw cost `C`. `spec`: `nothing`
+(copy), `:mean` (`(C - m) / mean(C - m)`), `:max` (`(C - m) / (max(C) - m)`),
+with `m = minimum(C)` and the divisor floored at `1e-10`, or a finite positive
+real divisor (`C / s`, no recentering). `:mean`/`:max` read finite entries only,
+so a penalty for an invalid candidate cannot set the temperature. Non-finite
+entries stay non-finite, and an all-non-finite `C` gives all ones.
+[`sanitize_cost!`](@ref) runs after scaling.
 """
 scale_cost!(Cs::AbstractMatrix, C::AbstractMatrix, ::Nothing) = copyto!(Cs, C)
 function scale_cost!(Cs::AbstractMatrix{T}, C::AbstractMatrix, spec::Symbol) where {T}
-    # halves keep c/2 - m/2 finite even when C spans +-floatmax
-    m = minimum(C) / 2
-    h = if spec === :mean
-        v = mean(c -> c / 2 - m, C)
-        isfinite(v) ? v : maximum(c -> c / 2 - m, C)
-    elseif spec === :max || spec === :max_cost   # :max_cost is the Python name
-        maximum(c -> c / 2 - m, C)
-    else
+    spec in (:mean, :max, :max_cost) ||
         throw(ArgumentError("scale_cost spec must be nothing, :mean, :max, or a positive real; got :$spec"))
+    nf = count(isfinite, C)
+    nf == 0 && return fill!(Cs, one(T))
+    allfin = nf == length(C)
+    m = (allfin ? minimum(C) : minimum(c -> isfinite(c) ? c : oftype(c, Inf), C)) / 2
+    half(c) = c / 2 - m
+    h = if spec === :mean
+        v = allfin ? mean(half, C) : oftype(m, NaN)
+        isfinite(v) ? v : sum(c -> isfinite(c) ? half(c) / nf : zero(m), C)
+    else
+        maximum(c -> isfinite(c) ? half(c) : zero(m), C)
     end
     Cs .= (C ./ 2 .- m) ./ max(T(h), T(5e-11), floatmin(T))
     return Cs
 end
 function scale_cost!(Cs::AbstractMatrix{T}, C::AbstractMatrix, s::Real) where {T}
-    (isfinite(s) && s > 0) ||
-        throw(ArgumentError("scale_cost divisor must be finite and > 0, got $s (negative would reverse the objective)"))
+    (isfinite(s) && s > 0 && T(s) > 0 && isfinite(T(s))) ||
+        throw(ArgumentError("scale_cost divisor must be finite and > 0 in $T, got $s"))
     Cs .= C ./ T(s)
     return Cs
 end
+
+_prepare_cost!(Cs::AbstractMatrix, C::AbstractMatrix, spec) =
+    sanitize_cost!(scale_cost!(Cs, C, spec))
 
 """
     center_cols!(Cs) -> Cs
@@ -287,13 +292,9 @@ center_cols!(Cs::AbstractMatrix) = (Cs .-= minimum(Cs; dims = 1); Cs)
     normalize_particle_masses!(Wn, plan) -> Wn
 
 `Wn[:, p] = plan[:, p] / sum(plan[:, p])`: normalization by the realized column
-mass (never by the marginal `a`): equal for softmax columns, and the
-translation-invariant choice for unconverged Sinkhorn plans. With this
-normalization the vertex-free centroid step `X .+= sr .* R*(V*Wn)` is
-algebraically identical to the explicit barycentric projection for every solver
-whose plan columns carry mass above the `1e-12` floor. A column at or below that
-floor yields `Wn = 0`: an exact per-particle no-op step, not a barycenter (the
-core loop holds the particle since its update is incremental).
+mass, not by the marginal `a`. With it the centroid step `X .+= sr .* R*(V*Wn)`
+equals the barycentric projection for every solver. A column with zero or
+non-finite mass gives `Wn = 0`, so the particle holds.
 """
 function normalize_particle_masses!(Wn::Matrix{T}, plan::Matrix{T}) where {T <: AbstractFloat}
     V, P = size(plan)
@@ -309,6 +310,8 @@ function normalize_particle_masses!(Wn::Matrix{T}, plan::Matrix{T}) where {T <: 
     return Wn
 end
 
+_has_mass(s) = s > 0 && isfinite(s)
+
 @inline function _normmass_col!(
         Wn::AbstractMatrix{T}, plan::AbstractMatrix{T}, V::Int, p::Int) where {T}
     @inbounds begin
@@ -316,9 +319,19 @@ end
         @simd for v in 1:V
             s += plan[v, p]
         end
-        invs = s > T(1e-12) ? one(T) / s : zero(T)
-        @simd ivdep for v in 1:V
-            Wn[v, p] = plan[v, p] * invs
+        invs = one(T) / s
+        if !_has_mass(s)
+            @simd ivdep for v in 1:V
+                Wn[v, p] = zero(T)
+            end
+        elseif isfinite(invs)
+            @simd ivdep for v in 1:V
+                Wn[v, p] = plan[v, p] * invs
+            end
+        else
+            @simd ivdep for v in 1:V
+                Wn[v, p] = plan[v, p] / s
+            end
         end
     end
     return nothing
@@ -326,7 +339,7 @@ end
 
 function normalize_particle_masses!(Wn::AbstractMatrix{T}, plan::AbstractMatrix) where {T}
     s = sum(plan; dims = 1)
-    Wn .= ifelse.(s .> T(1e-12), plan ./ s, zero(T))
+    Wn .= ifelse.(_has_mass.(s), plan ./ s, zero(T))
     return Wn
 end
 
@@ -340,9 +353,7 @@ function cuda_objective end
 """
     _batched_mul!(Y, A, B) -> Y
 
-`Y[:, :, p] = A[:, :, p] * B` for a shared right factor `B`. Generic fallback
-is a per-slice 5-arg `mul!`; the CUDA extension overrides with a stride-0
-`gemm_strided_batched!`.
+`Y[:, :, p] = A[:, :, p] * B` for a shared right factor `B`.
 """
 function _batched_mul!(Y::AbstractArray{<:Any, 3}, A::AbstractArray{<:Any, 3}, B::AbstractMatrix)
     @views for p in axes(A, 3)

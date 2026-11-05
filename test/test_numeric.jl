@@ -13,7 +13,6 @@ ref_lse(x) = (m = maximum(x); m + log(sum(exp.(x .- m))))
     @testset "splitmix64" begin
         # canonical SplitMix64 first output for seed 0
         @test splitmix64(UInt64(0)) == 0xe220a8397b1dcdaf
-        @test splitmix64(0, 1, 2) isa UInt64
         @test splitmix64(0, 1, 2) == splitmix64(0, 1, 2)
         @test splitmix64(0, 1, 2) != splitmix64(0, 2, 1)
         @test splitmix64(42) != splitmix64(43)
@@ -125,8 +124,17 @@ ref_lse(x) = (m = maximum(x); m + log(sum(exp.(x .- m))))
         scale_cost!(Csb, Cbig, :mean)
         @test all(isfinite, Csb)
         Cpm = [-1e308 1e308; 0.0 0.0]
-        @test scale_cost!(similar(Cpm), Cpm, :mean) == [0.0 1.0; 0.5 0.5]
+        @test scale_cost!(similar(Cpm), Cpm, :mean) == [0.0 2.0; 1.0 1.0]
         @test scale_cost!(similar(Cpm), Cpm, :max) == [0.0 1.0; 0.5 0.5]
+        C32 = reshape(Float32[-3f38, 3f38, 3f38, 3f38], 4, 1)
+        @test isapprox(vec(scale_cost!(similar(C32), C32, :mean)), Float32[0, 4 / 3, 4 / 3, 4 / 3])
+        Cinf = reshape([1000, 1000.5, 1001, 1000.2, Inf], 5, 1)
+        for spec in (:mean, :max)
+            Cs = PolyStep._prepare_cost!(similar(Cinf), Cinf, spec)
+            @test Cs[1:4] == scale_cost!(zeros(4, 1), Cinf[1:4, :], spec)[:]
+            @test Cs[5] == 2 * maximum(Cs[1:4]) + 1
+        end
+        @test_throws ArgumentError scale_cost!(zeros(Float32, 2, 2), ones(Float32, 2, 2), 1e-50)
     end
 
     @testset "normalize_particle_masses!" begin
@@ -138,9 +146,12 @@ ref_lse(x) = (m = maximum(x); m + log(sum(exp.(x .- m))))
         @test isapprox(Wn, plan ./ sum(plan; dims = 1); rtol = 1e-12)
         plan[:, 3] .= 0
         plan[:, 2] .= 1e-15
+        plan[:, 4] .= [1e-320, 3e-320, 0, 0]
+        plan[1, 5] = Inf
         normalize_particle_masses!(Wn, plan)
-        @test all(iszero, Wn[:, 3])
-        @test all(iszero, Wn[:, 2])
+        @test all(iszero, Wn[:, 3]) && all(iszero, Wn[:, 5])
+        @test all(isapprox(0.25), Wn[:, 2])
+        @test Wn[:, 4] == [0.25, 0.75, 0, 0]
         @test all(isfinite, Wn)
         # generic
         Wg = similar(plan)
