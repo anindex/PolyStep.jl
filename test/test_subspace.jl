@@ -5,12 +5,12 @@ const FULL_WIDTH_SHAPES = [(1, 64), (5, 5), (7,)]
 const MIXED_SHAPES = [(128, 32), (128,), (10, 128), (10,)]
 
 const PY_REFERENCE = Dict(
-    "districtnet_gnn" => Dict((1, 0) => 1295, (1, 256) => 393, (1, 512) => 512, (1, 1024) => 1024,
-                              (1, 2048) => 1295, (2, 0) => 2205, (2, 256) => 393, (2, 512) => 512,
-                              (2, 1024) => 1024, (2, 2048) => 2048, (4, 0) => 4025, (4, 256) => 393,
-                              (4, 512) => 512, (4, 1024) => 1024, (4, 2048) => 2048, (8, 0) => 7425,
-                              (8, 256) => 1287, (8, 512) => 1287, (8, 1024) => 1287,
-                              (8, 2048) => 2048, (32, 0) => 25857, (32, 512) => 25857),
+    "districtnet_gnn" => Dict((1, 0) => 1295, (1, 256) => 330, (1, 512) => 512, (1, 1024) => 1021,
+                              (1, 2048) => 1295, (2, 0) => 2205, (2, 256) => 330, (2, 512) => 511,
+                              (2, 1024) => 1024, (2, 2048) => 2048, (4, 0) => 4025, (4, 256) => 330,
+                              (4, 512) => 510, (4, 1024) => 1023, (4, 2048) => 2048, (8, 0) => 7425,
+                              (8, 256) => 330, (8, 512) => 512, (8, 1024) => 1021,
+                              (8, 2048) => 2048, (32, 0) => 25857, (32, 512) => 512),
     "bias_only" => Dict((1, 0) => 13, (1, 256) => 13, (2, 0) => 13, (4, 512) => 13, (8, 0) => 13,
                         (32, 2048) => 13),
     "full_width" => Dict((1, 0) => 81, (1, 512) => 81, (2, 0) => 91, (2, 1024) => 91, (4, 0) => 96,
@@ -18,13 +18,13 @@ const PY_REFERENCE = Dict(
     "mixed" => Dict((1, 0) => 436, (1, 256) => 256, (1, 512) => 436, (2, 0) => 734,
                     (2, 256) => 256, (2, 512) => 512, (2, 1024) => 734, (4, 0) => 1330,
                     (4, 512) => 512, (4, 1024) => 1024, (4, 2048) => 1330, (8, 0) => 2522,
-                    (8, 256) => 256, (8, 2048) => 2048, (32, 0) => 5514, (32, 1024) => 5514))
+                    (8, 256) => 256, (8, 2048) => 2048, (32, 0) => 5514, (32, 1024) => 1024))
 
 const PY_LAYOUTS = Dict("districtnet_gnn" => DN_GNN_SHAPES, "bias_only" => BIAS_ONLY_SHAPES,
                         "full_width" => FULL_WIDTH_SHAPES, "mixed" => MIXED_SHAPES)
 
-const PY_DN_COORDS_R8_CAP512 = [448, 448, 64, 1, 1, 64, 1, 1, 64, 1, 64, 1, 64, 64, 1]
-const PY_DN_COORDS_R1_CAP512 = [10, 10, 64, 18, 18, 64, 18, 18, 64, 18, 64, 17, 64, 64, 1]
+const PY_DN_COORDS_R8_CAP512 = [12, 12, 64, 28, 28, 64, 28, 28, 64, 28, 64, 26, 64, 1, 1]
+const PY_DN_COORDS_R1_CAP512 = [14, 14, 64, 25, 25, 64, 25, 25, 64, 25, 64, 25, 64, 13, 1]
 const PY_MIXED_COORDS_R4_CAP512 = [201, 128, 173, 10]
 const PY_MIXED_COORDS_R8_CAP256 = [63, 128, 55, 10]
 
@@ -127,9 +127,12 @@ const PY_MIXED_COORDS_R8_CAP256 = [63, 128, 55, 10]
         @test subspace_dim(HybridSubspace(mixed; rank = 8, max_subspace_dim = 256)) == 256
         @test subspace_dim(HybridSubspace(mixed; rank = 1, max_subspace_dim = 10_000)) == 436
         dn = ParamLayout([("p$(i)" => s) for (i, s) in enumerate(DN_GNN_SHAPES)])
-        s = (@test_logs (:warn,) match_mode = :any HybridSubspace(dn; rank = 8,
-                                                                  max_subspace_dim = 512))
-        @test subspace_dim(s) == 1287
+        @test subspace_dim(@test_logs HybridSubspace(dn; rank = 8, max_subspace_dim = 512)) == 512
+        cartpole = ParamLayout(["w1" => (4, 16), "b1" => (16,), "w2" => (16, 2), "b2" => (2,)])
+        for (r, nc) in ((2, [3, 16, 3, 2]), (4, [4, 16, 2, 2]))
+            s = @test_logs HybridSubspace(cartpole; rank = r, max_subspace_dim = 24)
+            @test [sp.ncoords for sp in s.specs] == nc
+        end
         s0 = (@test_logs (:warn,) HybridSubspace(mixed; rank = 4, max_subspace_dim = 0))
         @test subspace_dim(s0) == 140
         @test_throws ArgumentError HybridSubspace(dn; rank = 0)

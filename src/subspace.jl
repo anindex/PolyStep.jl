@@ -58,17 +58,17 @@ end
 """
     HybridSubspace(layout; rank, seed = 0, max_subspace_dim = nothing, T = Float64)
 
-Per-layer fixed orthonormal basis: `min(d_out*r + r*d_in, numel)` coordinates per array with
-2 or more dims, 1-D and full-width arrays unprojected. For N-D arrays `d_out` is the last axis
+Per-layer fixed orthonormal basis: `min(d_out*r + r*d_in, numel)` coordinates, with
+`r = min(rank, d_in, d_out)`, per array with 2 or more dims; 1-D and full-width arrays
+are searched directly. For N-D arrays `d_out` is the last axis
 and `d_in` the product of the others, so a Flux/Lux conv weight `(kw, kh, cin, cout)` has
 `d_out = cout`. The count is symmetric in `d_out` and `d_in`, so a 2-D `(out, in)` weight gets
-the same count either way. `max_subspace_dim` caps the total by shrinking the
-projected layers (`nothing` means no cap); a cap below the unprojected size plus one per
-projected layer warns and stops there.
+the same count either way. `max_subspace_dim` caps the total by shrinking every array with
+2 or more dims, full-width ones included (`nothing` means no cap); a cap below the 1-D size
+plus one per weight array warns and stops there.
 
-Each projected layer stores a dense `numel x ncoords` basis of eltype `T`. Unlike the Python
-version there is no sparse fallback for large layers: memory is `numel * ncoords * sizeof(T)`
-bytes per layer.
+Each projected layer stores a dense `numel x ncoords` basis of eltype `T`, so it takes
+`numel * ncoords * sizeof(T)` bytes. There is no sparse basis for large layers.
 """
 struct HybridSubspace{T <: AbstractFloat}
     specs::Vector{LayerSpec}
@@ -96,25 +96,24 @@ function _layer_coords(shape::Dims, numel::Int, rank::Int)
 end
 
 function _scale_to_budget(ncoords::Vector{Int}, projected::Vector{Bool}, numels::Vector{Int},
-                          max_dim::Int)
+                          isweight::Vector{Bool}, max_dim::Int)
     total = sum(ncoords; init = 0)
     total <= max_dim && return ncoords, projected
-    unprojected = sum(ncoords[k] for k in eachindex(ncoords) if !projected[k]; init = 0)
-    n_projected = count(projected)
-    target = max_dim - unprojected
-    if target < n_projected
-        target = n_projected
-        @warn "max_subspace_dim=$max_dim is unreachable: unprojected parameters take $unprojected coordinates and $n_projected projected layers need one each, so the subspace is $(unprojected + n_projected)."
+    fixed = sum(ncoords[k] for k in eachindex(ncoords) if !isweight[k]; init = 0)
+    n_weights = count(isweight)
+    target = max_dim - fixed
+    if target < n_weights
+        target = n_weights
+        @warn "max_subspace_dim=$max_dim is unreachable: 1-D parameters take $fixed coordinates and $n_weights weight layers need one each, so the subspace is $(fixed + n_weights)."
     end
-    projected_dim = total - unprojected
-    projected_dim <= target && return ncoords, projected
-    scale = target / projected_dim
+    total - fixed <= target && return ncoords, projected
+    scale = target / (total - fixed)
     nc = copy(ncoords)
     pr = copy(projected)
     remaining = target
-    left = n_projected
+    left = n_weights
     for k in eachindex(nc)
-        pr[k] || continue
+        isweight[k] || continue
         left -= 1
         headroom = min(numels[k], remaining - left)
         nc[k] = min(max(1, round(Int, ncoords[k] * scale)), headroom)
@@ -141,7 +140,8 @@ function HybridSubspace(layout::ParamLayout; rank::Int, seed::Int = 0,
     for (k, e) in enumerate(layout.entries)
         ncoords[k], projected[k] = _layer_coords(e.shape, e.numel, rank)
     end
-    ncoords, projected = _scale_to_budget(ncoords, projected, numels, max_dim)
+    isweight = [length(e.shape) >= 2 for e in layout.entries]
+    ncoords, projected = _scale_to_budget(ncoords, projected, numels, isweight, max_dim)
     specs = Vector{LayerSpec}(undef, length(numels))
     projections = Vector{Matrix{T}}(undef, length(numels))
     flat = 0
