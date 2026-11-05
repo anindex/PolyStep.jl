@@ -41,7 +41,7 @@ function SciMLBase.__solve(cache::OptimizationBase.OptimizationCache{O}) where {
                  sgn .* Vector{Float64}(batched(X))
 
     es = PolyStepES(dim; num_particles = opt.num_particles, epsilon = opt.epsilon,
-        step_radius = opt.step_radius, solver = opt.solver,
+        step_radius = opt.step_radius, radius_decay = opt.radius_decay, solver = opt.solver,
         scale_cost = opt.scale_cost, x0 = Vector{T}(vec(u0)),
         lb = flat(cache.lb), ub = flat(cache.ub), rng = rng, T = T)
 

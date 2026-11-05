@@ -69,6 +69,29 @@ using OptimizationBase: SciMLBase
         @test sol.u == u0
     end
 
+    @testset "solve! binding, scalar MaxSense, maxtime only, cache, constraints, decay" begin
+        @test PolyStep.solve! === OptimizationBase.solve!
+        prob = OptimizationProblem(OptimizationFunction((x, p) -> -sum(abs2, x .- 1)),
+            zeros(2); sense = MaxSense)
+        sol = @test_logs min_level = Logging.Error SciMLBase.solve(prob,
+            PolyStepOptimizer(step_radius = 0.1); maxiters = 200, rng = Xoshiro(3))
+        @test norm(sol.u .- 1) < 0.3
+        slow = X -> (sleep(0.002); vec(sum(abs2, X; dims = 1)))
+        solt = SciMLBase.solve(OptimizationProblem(sphere, u0), PolyStepOptimizer();
+            maxtime = 0.05, batched = slow)
+        @test solt.retcode == SciMLBase.ReturnCode.MaxTime
+        bat = X -> vec(sum(abs2, X; dims = 1))
+        cache = SciMLBase.init(OptimizationProblem(sphere, u0), PolyStepOptimizer(); maxiters = 5,
+            batched = bat, rng = Xoshiro(7))
+        @test solve!(cache).objective < sphere(u0, nothing)
+        pc = OptimizationProblem(OptimizationFunction(sphere; cons = (r, u, p) -> (r .= sum(u))),
+            u0; lcons = [0.0], ucons = [1.0])
+        @test_throws Exception SciMLBase.solve(pc, PolyStepOptimizer(); maxiters = 2, batched = bat)
+        sd = SciMLBase.solve(OptimizationProblem(sphere, u0),
+            PolyStepOptimizer(radius_decay = 0.97); maxiters = 600, batched = bat, rng = Xoshiro(8))
+        @test sd.objective < 1e-6
+    end
+
     @testset "Matrix u0 keeps its shape" begin
         target = [2.0 1.0; 1.0 2.0]
         fm(u, p) = sum(abs2, u * u' - target)          # needs u as a 2x2 matrix

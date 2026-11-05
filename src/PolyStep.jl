@@ -12,6 +12,7 @@ using Random
 using Statistics
 using StaticArrays
 using Polyester: @batch
+import CommonSolve: solve!, step!
 using PrecompileTools: @setup_workload, @compile_workload
 import SLEEFPirates
 
@@ -37,7 +38,6 @@ export PolyStepES, ask!, tell!, minimize, popsize, PolyStepOptimizer
 export ParamEntry, ParamLayout, LayerSpec, HybridSubspace
 export subspace_dim, compression_ratio, expand, expand!, project, project!,
        reconstruct_batch, subspace_objective
-# `solve` is not exported (CommonSolve/SciML name clash)
 
 @setup_workload begin
     sphere(X) = vec(sum(abs2, X; dims = 1))

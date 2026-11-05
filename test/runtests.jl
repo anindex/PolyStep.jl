@@ -4,6 +4,7 @@ using LinearAlgebra
 using Logging
 using Random
 using Statistics
+Base.find_package("LoopVectorization") === nothing || @eval using LoopVectorization
 
 @testset "PolyStep" begin
     include("test_numeric.jl")

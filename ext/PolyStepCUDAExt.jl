@@ -17,20 +17,4 @@ function PolyStep.cuda_objective(f_gpu; T::Type{<:AbstractFloat} = Float32)
     end
 end
 
-function PolyStep._batched_mul!(
-        Y::CuArray{T, 3}, A::CuArray{T, 3}, B::CuMatrix{T}) where {T <: Union{Float32, Float64}}
-    d, V, _ = size(Y)
-    CUDA.CUBLAS.gemm_strided_batched!('N', 'N', one(T), A, reshape(B, d, V, 1), zero(T), Y)
-    return Y
-end
-
-function PolyStep._batched_matvec!(
-        Y::CuMatrix{T}, A::CuArray{T, 3}, X::CuMatrix{T}) where {T <: Union{Float32, Float64}}
-    d, P = size(Y)
-    Y3 = reshape(Y, d, 1, P)
-    X3 = reshape(X, d, 1, P)
-    CUDA.CUBLAS.gemm_strided_batched!('N', 'N', one(T), A, X3, zero(T), Y3)
-    return Y
-end
-
 end

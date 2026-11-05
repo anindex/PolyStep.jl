@@ -169,6 +169,50 @@ sphere_b(X) = vec(sum(abs2, X; dims = 1))
         @test n[] == 4
     end
 
+    @testset "radius decay, eltype, promotion, warm duals, validation" begin
+        es = PolyStepES(3; step_radius = 1.0, radius_decay = 0.5, rng = Xoshiro(60))
+        for _ in 1:3
+            tell!(es, sphere_b(ask!(es)))
+        end
+        @test es.step_radius == 0.125
+        @test_throws ArgumentError PolyStepES(3; radius_decay = 0.0)
+        @test_throws ArgumentError PolyStepES(3; radius_decay = 1.5)
+        @test PolyStepES(2; x0 = Float32[1, 2]) isa PolyStepES{Float32}
+        @test_throws ArgumentError PolyStepES(2; x0 = 1.0)
+        @test_throws ArgumentError PolyStepES(2; lb = (0, 0), ub = (1, 1))
+        @test_throws ArgumentError PolyStepES(2; num_particles = 2, solver = SinkhornSolver(),
+            epsilon = Inf)
+        e32 = PolyStepES(2; x0 = [1.0, 1.0], step_radius = 0.1, T = Float32, rng = Xoshiro(5))
+        X = ask!(e32)
+        tell!(e32, 1e8 .+ sphere_b(Float64.(X)))
+        @test norm(e32.X .- 1) > 1e-3
+        ek = PolyStepES(4; num_particles = 3, solver = SinkhornSolver(), rng = Xoshiro(61))
+        tell!(ek, sphere_b(ask!(ek)))
+        @test ek.f isa AbstractVector && ek.g isa AbstractVector
+        er = PolyStepES(2; x0 = [0.3, 0.7], repair = X -> round.(X), rng = Xoshiro(62))
+        @test all(isinteger, ask!(er))
+        ev = PolyStepES(2; x0 = [0.3, 0.7], repair = X -> (X[1, :] .= round.(X[1, :])), rng = Xoshiro(63))
+        @test all(isinteger, ask!(ev)[1, :])
+        @test_throws DimensionMismatch ask!(PolyStepES(2; repair = X -> round.(X)[1:1, :]))
+        ek2 = PolyStepES(4; num_particles = 3, solver = SinkhornSolver(), rng = Xoshiro(61))
+        fit = sphere_b(ask!(ek2))
+        tell!(ek2, fit)
+        f1, g1 = copy(ek2.f), copy(ek2.g)
+        ask!(ek2)
+        tell!(ek2, fit)
+        @test ek2.f == PolyStep.solve(SinkhornSolver(), reshape(fit, 8, 3), ek2.epsilon;
+            scale_cost = ek2.scale_cost, f0 = f1, g0 = g1).f
+        ea = PolyStepES(2; x0 = Any[0.1, 0.2], rng = Xoshiro(64))
+        @test ea isa PolyStepES{Float64}
+        tell!(ea, Any[sphere_b(ask!(ea))...])
+        @test ea.evals == popsize(ea)
+        eb = PolyStepES(2; x0 = [1.0, 1.0], rng = Xoshiro(65))
+        Xb = ask!(eb)
+        tell!(eb, big"1e400" .* BigFloat.(sphere_b(Xb)))
+        @test mean(eb) != [1.0, 1.0] && eb.best_f == Inf
+        @test_throws DimensionMismatch minimize(X -> [3.0], 2; num_particles = 2, steps = 0)
+    end
+
     @testset "Float32 mode" begin
         es = PolyStepES(4; T = Float32, x0 = ones(Float32, 4), rng = Xoshiro(51))
         X = ask!(es)

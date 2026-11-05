@@ -1,25 +1,10 @@
 using CUDA
-using PolyStep: softmax_cols!, sanitize_cost!, normalize_particle_masses!,
-                 _batched_mul!, _batched_matvec!, cuda_objective
+using PolyStep: softmax_cols!, sanitize_cost!, normalize_particle_masses!, cuda_objective
 
 @testset "cuda extension" begin
     @assert CUDA.functional() "JPOLYSTEP_TEST_CUDA=1 but CUDA is not functional"
     rng = Xoshiro(2024)
-    d, V, P = 4, 8, 16
-    A = randn(rng, Float32, d, d, P)
-    B = randn(rng, Float32, d, V)
-    Yc = zeros(Float32, d, V, P)
-    _batched_mul!(Yc, A, B)
-    Yd = CUDA.zeros(Float32, d, V, P)
-    _batched_mul!(Yd, CuArray(A), CuArray(B))
-    @test isapprox(Array(Yd), Yc; rtol = 1e-5)
-
-    X = randn(rng, Float32, d, P)
-    Ycv = zeros(Float32, d, P)
-    _batched_matvec!(Ycv, A, X)
-    Ydv = CUDA.zeros(Float32, d, P)
-    _batched_matvec!(Ydv, CuArray(A), CuArray(X))
-    @test isapprox(Array(Ydv), Ycv; rtol = 1e-5)
+    V, P = 8, 16
 
     # generic solver kernels on device match CPU
     C = randn(rng, Float32, V, P)
