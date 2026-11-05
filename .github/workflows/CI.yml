@@ -18,9 +18,9 @@ jobs:
     name: Julia ${{ matrix.version }} - ${{ matrix.mode }}
     runs-on: ubuntu-latest
     timeout-minutes: 45
-    continue-on-error: ${{ matrix.version == 'nightly' }}
+    continue-on-error: ${{ matrix.version == 'pre' }}
     env:
-      JULIA_NUM_THREADS: ${{ matrix.version == 'nightly' && '1' || '2' }}
+      JULIA_NUM_THREADS: ${{ matrix.version == 'pre' && '1' || '2' }}
     strategy:
       fail-fast: false
       matrix:
@@ -31,7 +31,7 @@ jobs:
             mode: with-lv
           - version: '1'
             mode: without-lv
-          - version: 'nightly'
+          - version: 'pre'
             mode: with-lv
     steps:
       - uses: actions/checkout@v7
