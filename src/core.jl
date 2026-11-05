@@ -1,34 +1,38 @@
 """
     PolyStepConfig(; dim, kwargs...)
 
-Gradient-free polytope direct-search optimizer configuration. The objective is
-batched: `f(X::AbstractMatrix)::AbstractVector` maps `(d, N)` candidate
-columns to `N` costs (lower better); wrap a scalar function with
-[`columnwise`](@ref). Costs are measured at fractions `k/(num_probe+1)`,
-k = 1..num_probe, of `probe_radius` (see [`probe_scales`](@ref)), so the
-default single probe sits at half of it, the same distance as the default step.
-The step is taken at `step_radius` (decoupled). `epsilon`/`step_radius`/
-`probe_radius` accept a Real or an epsilon schedule; unscheduled radii are
-multiplied by the current epsilon (scheduled ones are not).
+Configuration for [`init_state`](@ref), [`step!`](@ref) and [`solve!`](@ref). The
+objective is batched: `f(X)` maps `(dim, N)` candidate columns to `N` costs
+(lower is better); wrap a scalar function with [`columnwise`](@ref).
 
-Dimension scaling: when vertex cost differences are small next to the OT
-temperature, one step is gradient descent with rate
-`sr * (pr/2) / (dim * eps_ot * s)` (`s` = `scale_cost` divisor), so at a fixed
-temperature the step shrinks as `1/dim`. For a larger `dim`, scale the OT
-temperature as `1/dim` through `ent_epsilon` (not `epsilon`, which also scales
-both radii, so the step would shrink as `1/dim^2`).
+| Keyword | Default | Meaning |
+|:--|:--|:--|
+| `polytope` | `:orthoplex` | probe template: `:orthoplex` (`2dim` vertices), `:simplex` (`dim+1`), `:cube` (`2^dim`, `dim <= 6`) |
+| `solver` | `SoftmaxSolver()` | weighting: see [`SinkhornSolver`](@ref), [`KLSoftmaxSolver`](@ref), [`MinCostGreedySolver`](@ref), [`TopKMeanSolver`](@ref) |
+| `epsilon` | `0.1` | temperature; also multiplies unscheduled radii. Real or schedule |
+| `ent_epsilon` | `nothing` | separate OT temperature that leaves the radii alone |
+| `scale_cost` | `1.0` | cost divisor: Real, `:mean`, `:max` or `nothing` |
+| `step_radius`, `probe_radius` | `1.0`, `2.0` | move and probe distances; Real or schedule |
+| `num_probe`, `probe_radius_jitter` | `1`, `0.0` | probes per vertex at `k/(num_probe+1)` of `probe_radius`; jitter in `[0, 1)` |
+| `max_iterations`, `min_iterations`, `threshold` | `50`, `5`, `1e-3` | stop when the mean squared step changes by less than `threshold` (relative) and is at most `threshold` times its peak |
+| `eval_chunk` | `0` | `> 0` splits each objective call into column chunks |
+| `lb`, `ub`, `repair` | `nothing` | box (scalars or vectors, `+-Inf` allowed) and `repair(X)` of evaluated points, in place or returned |
+| `biased_rotation` | `false` | turn each frame so a vertex points along the last descent direction |
+| `use_momentum`, `momentum_init`, `momentum_final`, `velocity_lr` | `false`, `0.5`, `0.95`, `1.0` | heavy-ball momentum, coefficient ramped linearly |
+| `use_adaptive_radius`, `stagnation_threshold`, `stagnation_patience` | `false`, `1e-4`, `10` | grow the radius on stagnation, shrink it on progress |
+| `radius_increase`, `radius_decrease`, `radius_min`, `radius_max` | `1.5`, `0.9`, `0.5`, `3.0` | adaptive radius multiplier and its bounds |
+| `use_quadratic_model` | `false` | finite-difference gradient and diagonal Hessian for `biased_rotation`, `newton_refinement` and `trust_region`; needs `:orthoplex`, `num_probe >= 2` |
+| `newton_refinement`, `newton_alpha` | `false`, `0.3` | blend a clamped Newton step into the transport target; needs `use_quadratic_model` |
+| `trust_region` | `false` | scale the step radius by predicted vs actual change of `f` at the clamped, repaired iterate; costs `P` extra evaluations per step; needs `use_quadratic_model` |
 
-Bounds and repair (these differ from `PolyStepES`): `lb`/`ub` clamp the
-evaluated probe points and box-project the iterate after each step; `repair`
-applies to evaluated candidates only. The iterate is a barycenter of template
-geometry and is not repaired (its `best_x` incumbent always is). `repair` runs
-after clamping and must itself preserve the bounds (re-clamping its output
-would corrupt integrality repairs). For cached candidates
-(evaluated == projected, repair respected end to end), use `PolyStepES`.
-Either bound may be `+-Inf` per coordinate (half-bounded boxes).
+With small cost differences next to the temperature, a step is gradient descent
+with rate `sr * (pr/2) / (dim * eps_ot * s)` (`s` is the `scale_cost` divisor), so
+in high dimension lower `ent_epsilon` rather than `epsilon`.
 
-`best_x`/`best_f` track the best evaluated point: every probe, plus the final
-iterate that [`solve!`](@ref) scores once at the end (clamped and repaired).
+Bounds clamp every evaluated point and box-project the iterate. `repair` runs after
+clamping on evaluated points only: the probes, the trust-region centers and the final
+iterate that `solve!` scores. It must keep them in the box. The iterate itself is not
+repaired. `best_x`/`best_f` hold the best evaluated point.
 """
 Base.@kwdef struct PolyStepConfig{S <: AbstractOTSolver, E, EE, SR, PR, SC, LB, UB, RP}
     dim::Int
@@ -122,6 +126,18 @@ function _validate(ps::PolyStepConfig)
         throw(ArgumentError("probe_radius must be >= 0, got $(ps.probe_radius)"))
     0 <= ps.probe_radius_jitter < 1 ||
         throw(ArgumentError("probe_radius_jitter must be in [0, 1), got $(ps.probe_radius_jitter) (>= 1 can drive the probe radius negative)"))
+    sched isa Real && isinf(sched) && ps.solver isa Union{SinkhornSolver, KLSoftmaxSolver} &&
+        throw(ArgumentError("$(nameof(typeof(ps.solver))) needs a finite OT epsilon; ent_epsilon = Inf works with SoftmaxSolver only"))
+    ps.velocity_lr > 0 || throw(ArgumentError("velocity_lr must be > 0, got $(ps.velocity_lr)"))
+    (0 <= ps.momentum_init < 1 && 0 <= ps.momentum_final < 1) ||
+        throw(ArgumentError("momentum_init and momentum_final must be in [0, 1), got $(ps.momentum_init), $(ps.momentum_final)"))
+    0 < ps.radius_min <= ps.radius_max ||
+        throw(ArgumentError("require 0 < radius_min <= radius_max, got $(ps.radius_min), $(ps.radius_max)"))
+    (ps.radius_increase >= 1 && 0 < ps.radius_decrease <= 1) ||
+        throw(ArgumentError("require radius_increase >= 1 and 0 < radius_decrease <= 1, got $(ps.radius_increase), $(ps.radius_decrease)"))
+    ps.stagnation_patience >= 1 ||
+        throw(ArgumentError("stagnation_patience must be >= 1, got $(ps.stagnation_patience)"))
+    ps.newton_alpha > 0 || throw(ArgumentError("newton_alpha must be > 0, got $(ps.newton_alpha)"))
     return ps
 end
 
@@ -174,8 +190,9 @@ mutable struct PolyStepState{T <: AbstractFloat, S <: AbstractOTSolver}
     stagnation_count::Int
     prev_loss::Float64
     tr_multiplier::Float64
-    prev_predicted::Union{Nothing, Float64}
-    prev_pre_step_loss::Union{Nothing, Float64}
+    center::Union{Nothing, Vector{T}}
+    prev_center::Union{Nothing, Vector{T}}
+    prev_predicted::Union{Nothing, Vector{T}}
     prev_descent::Union{Nothing, Matrix{T}}   # (d, P)
     best_x::Vector{T}                   # incumbent: best evaluated point
     best_f::Float64
@@ -243,7 +260,11 @@ function init_state(ps::PolyStepConfig, X0::AbstractMatrix{T}) where {T <: Abstr
         Matrix{T}(X0), fill(T(1) / P, P), 0,
         nothing, nothing,
         ps.use_momentum ? zeros(T, d, P) : nothing,
-        1.0, 0, Inf, 1.0, nothing, nothing, nothing,
+        1.0, 0, Inf, 1.0,
+        ps.trust_region ? zeros(T, P) : nothing,
+        ps.trust_region ? fill(T(NaN), P) : nothing,
+        ps.trust_region ? fill(T(NaN), P) : nothing,
+        nothing,
         fill(T(NaN), d), Inf, 0,
         Float64[], Bool[], Float64[], Float64[], 0.0,
         # orthoplex reads R columns directly, no Vt/dirs
@@ -353,6 +374,8 @@ end
 @inline _bound(b::AbstractVector, a) = @inbounds b[a]
 
 function _check_bounds(lb, ub)
+    (lb isa Union{Real, AbstractVector} && ub isa Union{Real, AbstractVector}) ||
+        throw(ArgumentError("lb and ub must be Reals or (dim,) vectors, got $(typeof(lb)) and $(typeof(ub))"))
     all(<(Inf), lb) || throw(ArgumentError("lb must be < Inf and not NaN, got $lb"))
     all(>(-Inf), ub) || throw(ArgumentError("ub must be > -Inf and not NaN, got $ub"))
     all(lb .<= ub) ||
@@ -404,9 +427,10 @@ end
 """
     step!(f, ps::PolyStepConfig, st::PolyStepState; rng=Random.default_rng()) -> Float64
 
-One PolyStep iteration; returns the mean sanitized cost (the step's loss
-proxy). `f` is the batched objective `(d, N) -> (N,)` and must return one
-cost per column.
+Run one PolyStep iteration. Return the mean vertex cost after sanitizing, or `Inf`
+when every vertex cost is non-finite. A vertex cost is the mean over its
+`num_probe` probes. `f` is the batched objective `(d, N) -> (N,)` and must return
+one cost per column.
 """
 Base.@nospecializeinfer function step!(@nospecialize(f), ps::PolyStepConfig,
         st::PolyStepState{T}; rng::AbstractRNG = Random.default_rng()) where {T}
@@ -424,23 +448,25 @@ Base.@nospecializeinfer function step!(@nospecialize(f), ps::PolyStepConfig,
             @simd for a in 1:d
                 nrm += st.prev_descent[a, p]^2
             end
-            inv = one(T) / max(sqrt(nrm), T(1e-10))
+            inv = sqrt(nrm) > T(1e-8) ? one(T) / sqrt(nrm) : zero(T)
             @simd ivdep for a in 1:d
                 st.bias[a, p] = st.prev_descent[a, p] * inv
             end
         end
-        biased_rotation!(st.R, st.bias)
+        _biased_rotation!(st.R, st.bias, st.Vt, st.cent, st.delta)
     end
 
-    # probe points (at probe radius; the step uses step radius)
     if ps.polytope === :orthoplex
         _probe_points_orthoplex!(st.Xprobe, st.X, st.R, pr, st.scales)
     else
-        _batched_mul!(st.dirs, st.R, st.Vt)
+        if ps.polytope === :simplex
+            _simplex_dirs!(st.dirs, st.R)
+        else
+            _batched_mul!(st.dirs, st.R, st.Vt)
+        end
         _probe_points_general!(st.Xprobe, st.X, st.dirs, pr, st.scales)
     end
 
-    # bounds / repair apply to evaluated candidates only
     if ps.lb !== nothing
         if st.clampflag === nothing
             st.Xprobe .= clamp.(st.Xprobe, ps.lb, ps.ub)
@@ -448,23 +474,34 @@ Base.@nospecializeinfer function step!(@nospecialize(f), ps::PolyStepConfig,
             _clamp_probes!(st.Xprobe, ps.lb, ps.ub, st.clampflag, V * K)
         end
     end
-    ps.repair === nothing || ps.repair(st.Xprobe)
+    _repair!(ps.repair, st.Xprobe)
 
-    # objective (dominant cost)
     ncols = K * V * P
     _eval_cols!(f, st.losses, st.Xprobe, ps.eval_chunk)
     st.evals += ncols
+    if st.center !== nothing
+        copyto!(st.cent, st.X)
+        ps.lb === nothing || (st.cent .= clamp.(st.cent, ps.lb, ps.ub))
+        _repair!(ps.repair, st.cent)
+        _eval_cols!(f, st.center, st.cent, ps.eval_chunk)
+        st.evals += P
+        cf, cidx = _best_finite(st.center)
+        if cidx != 0 && cf < st.best_f
+            st.best_f = cf
+            st.best_x .= view(st.cent, :, cidx)
+        end
+    end
 
     bf, bidx = _best_finite(st.losses)
     if bidx != 0 && bf < st.best_f
         st.best_f = Float64(bf)
         st.best_x .= view(st.Xprobe, :, bidx)
     end
-    st.last_all_nonfinite = bidx == 0     # divergence signal (raw, pre-sanitize)
 
     _cost_from_losses!(st.Craw, st.losses, K)
-    sanitize_cost!(st.Craw)
+    st.last_all_nonfinite = !any(isfinite, st.Craw)
     scale_cost!(st.Csolve, st.Craw, ps.scale_cost)
+    sanitize_cost!(st.Craw)
 
     quad_ready = st.losses3 !== nothing
     fd_ready = quad_ready && (ps.biased_rotation || ps.trust_region || ps.newton_refinement)
@@ -485,16 +522,24 @@ Base.@nospecializeinfer function step!(@nospecialize(f), ps::PolyStepConfig,
         end
     end
 
-    tr_proxy = ps.trust_region ?
-               Float64(mean(st.Craw)) -
-               0.5 * Float64(pr)^2 * Float64(mean(abs2, st.scales)) * Float64(mean(st.H)) : 0.0
-    if ps.trust_region && st.prev_predicted !== nothing && st.prev_pre_step_loss !== nothing
-        st.tr_multiplier = update_trust_region(st.prev_predicted,
-            tr_proxy - st.prev_pre_step_loss,
-            st.tr_multiplier)
-        push!(st.trust_multipliers, st.tr_multiplier)
-        st.prev_predicted = nothing
-        st.prev_pre_step_loss = nothing
+    if st.center !== nothing
+        pred = actual = 0.0
+        n = 0
+        @inbounds for p in 1:P
+            dp = Float64(st.center[p]) - Float64(st.prev_center[p])
+            if isfinite(dp) && isfinite(st.prev_predicted[p])
+                pred += st.prev_predicted[p]
+                actual += dp
+                n += 1
+            end
+        end
+        if n > 0
+            m_old = st.tr_multiplier
+            st.tr_multiplier = update_trust_region(pred / n, actual / n, m_old)
+            push!(st.trust_multipliers, st.tr_multiplier)
+            sr_f *= st.tr_multiplier / m_old
+            sr = T(sr_f)
+        end
     end
 
     ot_eps = ps.ent_epsilon === nothing ? eps :
@@ -503,6 +548,7 @@ Base.@nospecializeinfer function step!(@nospecialize(f), ps::PolyStepConfig,
     local ot_conv::Bool
     if st.solver isa SoftmaxSolver
         _check_eps(ot_eps)
+        sanitize_cost!(st.Csolve)
         softmax_cols!(st.Wn, st.Csolve, ot_eps)
         newf = nothing
         newg = nothing
@@ -514,7 +560,7 @@ Base.@nospecializeinfer function step!(@nospecialize(f), ps::PolyStepConfig,
         if sched isa ProgressiveEpsilon &&
            !(st.solver isa SinkhornSolver && st.solver.threshold <= 0)
             update!(sched; n_iters = res.iters, max_iterations = st.solver.max_iterations,
-                converged = res.converged)
+                converged = res.converged && !st.last_all_nonfinite)
         end
         normalize_particle_masses!(st.Wn, res.plan)
         newf = res.f
@@ -532,49 +578,49 @@ Base.@nospecializeinfer function step!(@nospecialize(f), ps::PolyStepConfig,
         mul!(st.cent, st.Vt, st.Wn)
     end
     _batched_matvec!(st.delta, st.R, st.cent)
-    if ps.use_momentum
-        beta = T(momentum_coefficient(st.iteration, ps.max_iterations,
-            ps.momentum_init, ps.momentum_final))
-        @. st.velocity = beta * st.velocity + sr * st.delta
-        @. st.X += T(ps.velocity_lr) * st.velocity
-    else
-        @. st.X += sr * st.delta
+    st.delta .*= sr
+
+    if ps.biased_rotation
+        st.prev_descent === nothing && (st.prev_descent = zeros(T, d, P))
+        if fd_ready
+            _batched_matvec!(st.prev_descent, st.R, st.G)
+            st.prev_descent .*= -1
+        else
+            copyto!(st.prev_descent, st.delta)
+        end
     end
 
-    duals_stale = false
-    if ps.biased_rotation && fd_ready
-        st.prev_descent === nothing && (st.prev_descent = zeros(T, d, P))
-        _batched_matvec!(st.prev_descent, st.R, st.G)
-        st.prev_descent .*= -1        # descent = -R * fd_grad
-    elseif ps.biased_rotation
-        # OT fallback: descent = sr * delta (scale as in Python)
-        st.prev_descent === nothing && (st.prev_descent = zeros(T, d, P))
-        @. st.prev_descent = sr * st.delta
-    end
-
-    # Newton refinement moves X after OT, so the duals go stale
     if ps.newton_refinement && quad_ready
+        st.X .+= st.delta
         newton_refinement!(st.Xref, st.X, st.G, st.H, st.N, st.refrot,
             st.losses3, st.scales, pr, st.R, st.Xprev;
             alpha = ps.newton_alpha, max_step_norm = sr_f * 0.5,
             hessian_reg = 1e-4, mask = st.clampflag, fd_ready = fd_ready)
-        if all(isfinite, st.Xref)
-            if st.velocity !== nothing && ps.velocity_lr != 0
-                @. st.velocity += (st.Xref - st.X) / T(ps.velocity_lr)
+        @inbounds for p in 1:P
+            if all(isfinite, view(st.Xref, :, p))
+                for i in 1:d
+                    st.delta[i, p] = st.Xref[i, p] - st.Xprev[i, p]
+                end
             end
-            copyto!(st.X, st.Xref)
-            duals_stale = true
         end
+        copyto!(st.X, st.Xprev)
+    end
+    if ps.use_momentum
+        beta = T(momentum_coefficient(st.iteration, ps.max_iterations,
+            ps.momentum_init, ps.momentum_final))
+        @. st.velocity = beta * st.velocity + st.delta
+        @. st.X += T(ps.velocity_lr) * st.velocity
+    else
+        st.X .+= st.delta
     end
 
     ps.lb === nothing || (st.X .= clamp.(st.X, ps.lb, ps.ub))
 
-    # adaptive radius on each particle's best vertex
-    cost_mean = Float64(mean(st.Craw))
+    cost_mean = st.last_all_nonfinite ? Inf : Float64(mean(st.Craw))
     if ps.use_adaptive_radius
+        progress = st.last_all_nonfinite ? Inf : Float64(mean(minimum, eachcol(st.Craw)))
         st.radius_multiplier, st.stagnation_count, st.prev_loss = update_adaptive_radius(
-            Float64(mean(minimum, eachcol(st.Craw))), st.prev_loss, st.stagnation_count,
-            st.radius_multiplier;
+            progress, st.prev_loss, st.stagnation_count, st.radius_multiplier;
             stagnation_threshold = ps.stagnation_threshold,
             stagnation_patience = ps.stagnation_patience,
             radius_increase = ps.radius_increase,
@@ -587,8 +633,6 @@ Base.@nospecializeinfer function step!(@nospecialize(f), ps::PolyStepConfig,
         copyto!(st.X, st.Xprev)
         st.velocity === nothing || fill!(st.velocity, zero(T))
         st.prev_descent = nothing
-    end
-    if nan_reverted || duals_stale
         st.f = nothing
         st.g = nothing
     else
@@ -596,9 +640,14 @@ Base.@nospecializeinfer function step!(@nospecialize(f), ps::PolyStepConfig,
         st.g = newg
     end
 
-    if ps.trust_region && fd_ready
-        st.prev_predicted = predicted_improvement_mean(st.G, st.H, st.R, st.X, st.Xprev)
-        st.prev_pre_step_loss = tr_proxy
+    if st.center !== nothing
+        predicted_improvement!(st.prev_predicted, st.G, st.H, st.R, st.X, st.Xprev)
+        if st.clampflag !== nothing
+            @inbounds for p in 1:P
+                st.clampflag[p] && (st.prev_predicted[p] = T(NaN))
+            end
+        end
+        st.prev_center, st.center = st.center, st.prev_center
     end
 
     push!(st.costs, cost_mean)
@@ -634,11 +683,20 @@ function _eval_losses!(f::F, dst::AbstractVector, X::AbstractMatrix) where {F}
     return dst
 end
 
+function _repair!(r, X)
+    r === nothing && return X
+    y = r(X)
+    (y isa AbstractArray && y !== X && !(y isa SubArray && parent(y) === X)) || return X
+    size(y) == size(X) ||
+        throw(DimensionMismatch("repair returned size $(size(y)), expected $(size(X))"))
+    return copyto!(X, y)
+end
+
 Base.@nospecializeinfer function _score_iterate!(@nospecialize(f), ps::PolyStepConfig,
         st::PolyStepState)
     Xc = copy(st.X)
     ps.lb === nothing || (Xc .= clamp.(Xc, ps.lb, ps.ub))
-    ps.repair === nothing || ps.repair(Xc)
+    _repair!(ps.repair, Xc)
     fx = _eval_cols!(f, similar(st.a), Xc, ps.eval_chunk)
     st.evals += length(fx)
     bf, bidx = _best_finite(fx)
@@ -661,12 +719,13 @@ _diverged(st::PolyStepState) = st.last_all_nonfinite
 """
     solve!(f, ps::PolyStepConfig, st::PolyStepState; rng, callback=nothing) -> PolyStepState
 
-Outer loop: runs up to `ps.max_iterations` steps, checking the
-displacement-plateau convergence criterion once `min_iterations` steps have run
-(Python's `i + 1 >= min_iterations`) and divergence after every step.
-`callback(st) -> true` stops early. At the end the final iterate is scored once
-(`P` extra evaluations, clamped and repaired like a probe) and can become
-`st.best_x`/`st.best_f`.
+Run up to `ps.max_iterations` steps. From step `max(min_iterations, 3)` on, stop
+when the mean squared step changes by less than `threshold` (relative) and is at
+most `threshold` times its peak. Stop after a step where every vertex cost is
+non-finite. `callback(st) -> true` stops early. The final iterate
+is then scored once (`P` evaluations, clamped and repaired) and can become
+`st.best_x`/`st.best_f`. Per-step diagnostics: `st.costs`, `st.ot_converged`,
+`st.disp_sqnorms`, `st.trust_multipliers`.
 """
 function solve!(f, ps::PolyStepConfig, st::PolyStepState;
         rng::AbstractRNG = Random.default_rng(), callback = nothing)

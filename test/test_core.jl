@@ -1,10 +1,12 @@
 using PolyStep
 using PolyStep: _resolve_radii, _batched_mul!, _batched_matvec!, normalize_particle_masses!,
-                 fd_gradient!, fd_hessian_diag!, newton_step!, predicted_improvement,
-                 predicted_improvement_mean, update_trust_region,
+                 fd_gradient!, fd_hessian_diag!, newton_step!, predicted_improvement!,
+                 update_trust_region,
                  momentum_coefficient, update_adaptive_radius, solve
 
 sphere(X) = vec(sum(abs2, X; dims = 1))
+eye3(d, P) = repeat(Matrix{Float64}(I, d, d), 1, 1, P)
+pimp(G, H, S) = predicted_improvement!(zeros(size(G, 2)), G, H, eye3(size(G)...), S, zero(S))
 
 @testset "core" begin
     @testset "dynamics units" begin
@@ -60,15 +62,24 @@ sphere(X) = vec(sum(abs2, X; dims = 1))
         N = zeros(d, P)
         newton_step!(N, G, H; max_step_norm = 0.01)
         @test all(p -> norm(N[:, p]) <= 0.01 + 1e-12, 1:P)
-        @test all(<=(0), predicted_improvement(G, H, N))            # descent step predicts improvement
+        @test all(<=(0), pimp(G, H, N))
         N2 = zeros(2, 1)
         newton_step!(N2, reshape([1e3, 1.0], 2, 1), reshape([1e-8, 1.0], 2, 1); max_step_norm = 1.0)
         @test isapprox(vec(N2), [-1, -1] ./ sqrt(2))
-        @test predicted_improvement(zeros(1, 1), fill(-5.0, 1, 1), ones(1, 1))[1] == 0.5e-4
+        @test pimp(zeros(1, 1), fill(-5.0, 1, 1), ones(1, 1))[1] == 0.5e-4
         X1 = X .+ 0.1 .* randn(rng, d, P)
         S = reduce(hcat, [R[:, :, p]' * (X1[:, p] - X[:, p]) for p in 1:P])
-        @test isapprox(predicted_improvement_mean(G, H, R, X1, X),
-            mean(predicted_improvement(G, H, S)))
+        @test isapprox(predicted_improvement!(zeros(P), G, H, R, X1, X), pimp(G, H, S))
+        N1 = zeros(1, 1)
+        newton_step!(N1, ones(1, 1), ones(1, 1); max_step_norm = 1e-12)
+        @test N1[1] == -1e-12
+        g = [1.0, -2.0, 0.5]
+        L3 = zeros(2, 6, 1)
+        for (k, sk) in enumerate((0.7, 1.3)), i in 1:3
+            L3[k, i, 1] = 5 + g[i] * sk * 1e-11
+            L3[k, 3 + i, 1] = 5 - g[i] * sk * 1e-11
+        end
+        @test isapprox(vec(fd_gradient!(zeros(3, 1), L3, [0.7, 1.3], 1e-11)), g; rtol = 1e-3)
     end
 
     @testset "probe point layout (k fastest, then v, then p)" begin
@@ -180,9 +191,8 @@ sphere(X) = vec(sum(abs2, X; dims = 1))
         for _ in 1:8
             step!(sphere, ps, st; rng)
             @test isapprox(st.X - st.Xprev, ps.velocity_lr .* st.velocity; atol = 1e-12)
-            # the trust-region prediction is for the move actually taken
             @test st.prev_predicted ==
-                  predicted_improvement_mean(st.G, st.H, st.R, st.X, st.Xprev)
+                  predicted_improvement!(similar(st.prev_predicted), st.G, st.H, st.R, st.X, st.Xprev)
         end
     end
 
@@ -196,18 +206,31 @@ sphere(X) = vec(sum(abs2, X; dims = 1))
         @test st.prog_ent.smoothed == 0.1   # not inflated
     end
 
-    @testset "trust-region proxy is the center value under a shrinking probe radius" begin
+    @testset "trust region scores center evaluations and applies its radius at once" begin
         A = [3.0 1.0 0.0; 1.0 2.0 0.5; 0.0 0.5 1.0]
         quad(X) = vec(sum(X .* (A * X); dims = 1)) ./ 2
         ps = PolyStepConfig(dim = 3, epsilon = LinearEpsilon(init = 0.5, target = 0.01, decay = 0.1),
             num_probe = 3, use_quadratic_model = true, trust_region = true)
         st = init_state(ps, randn(Xoshiro(41), 3, 5))
         rng = Xoshiro(42)
-        for _ in 1:4
+        changed = false
+        for _ in 1:12
             Xc = copy(st.X)
+            e0 = st.evals
+            st0 = deepcopy(st)
+            rng0 = copy(rng)
             step!(quad, ps, st; rng)
-            @test isapprox(st.prev_pre_step_loss, mean(quad(Xc)); rtol = 1e-10)
+            @test st.prev_center == quad(Xc)
+            @test st.evals - e0 == 3 * 6 * 5 + 5
+            if st.tr_multiplier != st0.tr_multiplier
+                changed = true
+                st0.tr_multiplier = st.tr_multiplier
+                fill!(st0.prev_predicted, NaN)
+                step!(quad, ps, st0; rng = rng0)
+                @test isapprox(st0.X, st.X; rtol = 1e-12)
+            end
         end
+        @test changed
     end
 
     @testset "non-finite probes leave a finite quadratic model" begin
@@ -217,20 +240,35 @@ sphere(X) = vec(sum(abs2, X; dims = 1))
         st = init_state(ps, fill(1.0, 3, 4))
         step!(nanfar, ps, st; rng = Xoshiro(43))
         @test all(isfinite, st.G) && all(isfinite, st.H)
-        @test isfinite(st.prev_predicted)
+        @test all(isfinite, st.prev_predicted)
     end
 
-    @testset "newton refinement invalidates duals" begin
+    @testset "newton refinement keeps the duals and runs before momentum" begin
         ps = PolyStepConfig(dim = 3, epsilon = 0.5, num_probe = 2, use_quadratic_model = true,
             newton_refinement = true, solver = SinkhornSolver(max_iterations = 200))
         st = init_state(ps, randn(Xoshiro(9), 3, 6))
         step!(sphere, ps, st; rng = Xoshiro(10))
-        @test st.f === nothing && st.g === nothing
+        @test st.f !== nothing && st.g !== nothing
+        kw = (dim = 2, epsilon = 1.0, step_radius = 4.0, num_probe = 2,
+            use_quadratic_model = true, newton_refinement = true)
+        X0 = ones(2, 1)
+        sn = init_state(PolyStepConfig(; kw...), X0)
+        step!(sphere, PolyStepConfig(; kw...), sn; rng = Xoshiro(2))
+        pm = PolyStepConfig(; kw..., use_momentum = true, velocity_lr = 0.25)
+        sm = init_state(pm, X0)
+        step!(sphere, pm, sm; rng = Xoshiro(2))
+        @test sn.X != X0
+        @test isapprox(sm.X - X0, 0.25 .* (sn.X - X0); rtol = 1e-12)
         # without refinement, Sinkhorn duals persist for warm start
         ps2 = PolyStepConfig(dim = 3, epsilon = 0.5, solver = SinkhornSolver(max_iterations = 200))
         st2 = init_state(ps2, randn(Xoshiro(9), 3, 6))
         step!(sphere, ps2, st2; rng = Xoshiro(10))
         @test st2.f !== nothing
+        cold = deepcopy(st2)
+        cold.f = cold.g = nothing
+        step!(sphere, ps2, st2; rng = Xoshiro(11))
+        step!(sphere, ps2, cold; rng = Xoshiro(11))
+        @test st2.X != cold.X && isapprox(st2.X, cold.X; rtol = 1e-3)
     end
 
     @testset "NaN revert" begin

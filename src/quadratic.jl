@@ -2,7 +2,7 @@
     fd_gradient!(G, losses3, scales, probe_radius) -> G
 
 Central difference averaged over probe scales:
-`G[i,p] = mean_k (L[k,i,p] - L[k,d+i,p]) / max(2*scales[k]*r, 1e-10)`.
+`G[i,p] = mean_k (L[k,i,p] - L[k,d+i,p]) / (2*scales[k]*r)`.
 `G` is in the rotated frame, shape (d, P).
 """
 function fd_gradient!(G::AbstractMatrix{T}, losses3::AbstractArray{T, 3},
@@ -13,7 +13,7 @@ function fd_gradient!(G::AbstractMatrix{T}, losses3::AbstractArray{T, 3},
     @inbounds for p in 1:P, i in 1:d
         acc = zero(T)
         for k in 1:K
-            denom = max(T(2 * scales[k] * probe_radius), T(1e-10))
+            denom = max(T(2 * scales[k] * probe_radius), floatmin(T))
             acc += (losses3[k, i, p] - losses3[k, d + i, p]) / denom
         end
         G[i, p] = acc / K
@@ -80,8 +80,8 @@ function newton_step!(N::AbstractMatrix{T}, G::AbstractMatrix{T}, H::AbstractMat
             N[i, p] = delta
             nrm2 += delta * delta
         end
-        nrm = max(sqrt(nrm2), T(1e-10))
-        sc = min(m / nrm, one(T))
+        nrm = sqrt(nrm2)
+        sc = nrm > m ? m / nrm : one(T)
         for i in 1:d
             N[i, p] *= sc
         end
@@ -90,53 +90,29 @@ function newton_step!(N::AbstractMatrix{T}, G::AbstractMatrix{T}, H::AbstractMat
 end
 
 """
-    predicted_improvement(G, H, S; hessian_reg=1e-4) -> Vector (P,)
+    predicted_improvement!(out, G, H, R, X, X0; hessian_reg=1e-4) -> out
 
-Quadratic-model loss change `g'delta + 0.5*delta'H delta` per particle
-(negative = improvement), with the curvature floored at `hessian_reg` as in `newton_step!`.
+Per-particle quadratic-model loss change `g's + 0.5 s'H s` for the realized move
+`X - X0`, in the rotated frame `s = R[:, :, p]' (X - X0)[:, p]` where `G`/`H`
+live (negative = improvement), curvature floored at `hessian_reg`.
 """
-function predicted_improvement(G::AbstractMatrix{T}, H::AbstractMatrix{T},
-        S::AbstractMatrix{T}; hessian_reg::Real = 1e-4) where {T}
+function predicted_improvement!(out::AbstractVector{T}, G::AbstractMatrix{T},
+        H::AbstractMatrix{T}, R::AbstractArray{T, 3}, X::AbstractMatrix{T},
+        X0::AbstractMatrix{T}; hessian_reg::Real = 1e-4) where {T}
     d, P = size(G)
     reg = T(hessian_reg)
-    out = Vector{T}(undef, P)
-    @inbounds for p in 1:P
-        acc = zero(T)
-        @simd for i in 1:d
-            acc += G[i, p] * S[i, p] + T(0.5) * max(H[i, p], reg) * S[i, p]^2
-        end
-        out[p] = acc
-    end
-    return out
-end
-
-"""
-    predicted_improvement_mean(G, H, R, X, X0; hessian_reg=1e-4) -> Float64
-
-Mean over particles of the quadratic-model loss change `g's + 0.5 s'H s` for the
-realized move `X - X0`, taken in the rotated frame `s = R[:, :, p]' (X - X0)[:, p]`
-where `G`/`H` live (negative = improvement), curvature floored at `hessian_reg`.
-Allocation-free companion to `predicted_improvement` for the trust-region ratio.
-"""
-function predicted_improvement_mean(G::AbstractMatrix{T}, H::AbstractMatrix{T},
-        R::AbstractArray{T, 3}, X::AbstractMatrix{T}, X0::AbstractMatrix{T};
-        hessian_reg::Real = 1e-4) where {T}
-    d, P = size(G)
-    P == 0 && return 0.0
-    reg = T(hessian_reg)
-    acc = 0.0
     @inbounds for p in 1:P
         a = zero(T)
         for i in 1:d
             s = zero(T)
-            @simd for j in 1:d      # R' rows = R columns
+            @simd for j in 1:d
                 s += R[j, i, p] * (X[j, p] - X0[j, p])
             end
             a += G[i, p] * s + T(0.5) * max(H[i, p], reg) * s^2
         end
-        acc += Float64(a)
+        out[p] = a
     end
-    return acc / P
+    return out
 end
 
 """

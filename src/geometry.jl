@@ -41,8 +41,7 @@ end
     cube_vertices([T,] dim; radius=1) -> (dim, 2^dim)
 
 Hypercube template, `/sqrt(dim)` normalized. Vertex column `v` encodes the
-0-based index `i = v-1`; coordinate `a` reads bit `a-1`: bit 0 -> +1, bit 1 -> -1
-(exact port of geometry.py:79-111, `signs = 1 - 2*bits`).
+0-based index `i = v-1`; coordinate `a` reads bit `a-1`: bit 0 -> +1, bit 1 -> -1.
 """
 function cube_vertices(::Type{T}, dim::Integer; radius::Real = 1) where {T <: AbstractFloat}
     dim >= 1 || throw(ArgumentError("dim must be >= 1, got $dim"))
@@ -95,8 +94,7 @@ end
 """
     probe_scales(T, K) -> Vector{T}
 
-Fractional probe radii: `range(0, 1, K+2)[2:K+1]` == torch
-`linspace(0,1,K+2)[1:K+1]` (0-based). K=1 -> `[0.5]`.
+Fractional probe radii `k/(K+1)`, `k = 1..K`. K=1 -> `[0.5]`.
 """
 probe_scales(::Type{T}, K::Integer) where {T} = collect(T, range(0, 1; length = K + 2))[2:(K + 1)]
 
@@ -115,8 +113,8 @@ scratch for d = 3..8 and may alias `R` (each slice is read fully before it is
 written). All Gaussians come serially from one rng and the per-slice work is
 deterministic given them, so results are bit-identical for any thread count.
 
-d=2: analytic rotation from theta ~ U[0,2 * pi) (matches geometry.py:173-176; consumes
-one uniform per particle, no QR). d=3..8: StaticArrays QR of a Gaussian matrix.
+d=2: analytic rotation from theta ~ U[0,2 * pi), one uniform per particle.
+d=3..8: StaticArrays QR of a Gaussian matrix.
 d>8: Stewart (1980): reflector j of the Householder QR of a Gaussian matrix is
 drawn directly from d-j+1 fresh Gaussians (its law under QR), then Q is
 accumulated from the reflectors. d>2: Mezzadri sign fix, then a det=+1 flip of
@@ -316,29 +314,46 @@ end
 end
 
 """
-    biased_rotation!(R, bias) -> R
+    biased_rotation!(R, bias, Vt = nothing) -> R
 
-Make column 1 of each rotation the direction of `bias[:, p]`: one Householder
-reflection maps `R[:, 1]` to `+-bias[:, p]` (sign chosen to avoid cancellation)
-and is applied to every column, then a column sign flip restores det=+1. For
-Haar `R`, columns 2..d are uniform on the bias complement (the law of the
-Gram-Schmidt in geometry.py `apply_biased_rotation`). A slice keeps its rotation
-when its bias has squared norm < 0.25 or a non-finite entry, or its rotation is
-non-finite. d=1 returns `R` unchanged (SO(1) = {1}).
+Turn each rotation so that a polytope vertex points along `bias[:, p]`. Without a
+template (the orthoplex), one Householder reflection maps `R[:, 1]` onto the bias
+and a column sign flip restores det=+1; for Haar `R` the other columns stay uniform
+on the bias complement. With a template `Vt` (unit-norm vertices as columns), the
+vertex `v` nearest the bias, `argmax_v (R'b)'v`, is sent onto `b` by the minimal
+rotation `R + ((1+2c)b - u)/(1+c) v' - (u+b)/(1+c) (R'b)'` with `b` scaled to unit
+norm, `u = Rv` and `c = u'b`. A slice keeps its rotation when the squared norm of
+its bias is below 0.25 or not finite, or when its rotation is not finite.
 """
-function biased_rotation!(R::Array{T, 3}, bias::AbstractMatrix{T}) where {T <: AbstractFloat}
+function biased_rotation!(R::Array{T, 3}, bias::AbstractMatrix{T},
+        Vt::Union{Nothing, AbstractMatrix{T}} = nothing) where {T <: AbstractFloat}
+    d, P = size(R, 1), size(R, 3)
+    buf = Vt === nothing ? nothing : Array{T}(undef, d, P)
+    return _biased_rotation!(R, bias, Vt, buf, buf === nothing ? nothing : similar(buf))
+end
+
+function _biased_rotation!(R::Array{T, 3}, bias::AbstractMatrix{T}, Vt, bR, u) where {T}
     d = size(R, 1)
     P = size(R, 3)
     size(bias) == (d, P) || throw(DimensionMismatch("bias must be (d,P)"))
     d == 1 && return R
-    _foreach_slice(p -> _biased_slice!(view(R, :, :, p), view(bias, :, p)), P, P * d^2 >= 200_000)
+    big = P * d^2 >= 200_000
+    if Vt === nothing
+        _foreach_slice(p -> _biased_slice!(view(R, :, :, p), view(bias, :, p)), P, big)
+    else
+        size(Vt, 1) == d || throw(DimensionMismatch("Vt must have $d rows"))
+        _foreach_slice(p -> _biased_vertex_slice!(view(R, :, :, p), view(bias, :, p), Vt,
+                view(bR, :, p), view(u, :, p)), P, big)
+    end
     return R
 end
+
+_skip_bias(A, b, bb) = !(0.25 <= bb < Inf) || !all(isfinite, b) || !all(isfinite, A)
 
 @noinline function _biased_slice!(A::AbstractMatrix{T}, b::AbstractVector{T}) where {T}
     d = size(A, 1)
     bb = sum(abs2, b)
-    (bb < T(0.25) || !all(isfinite, b) || !all(isfinite, A)) && return nothing
+    _skip_bias(A, b, bb) && return nothing
     nb = inv(sqrt(bb))
     aa = ab = zero(T)
     @inbounds for i in 1:d
@@ -361,4 +376,61 @@ end
     @. A[:, 1] = b * nb
     s < 0 && (view(A, :, d) .*= -one(T))
     return nothing
+end
+
+@noinline function _biased_vertex_slice!(A::AbstractMatrix{T}, b::AbstractVector{T},
+        Vt::AbstractMatrix{T}, bR::AbstractVector{T}, u::AbstractVector{T}) where {T}
+    d = size(A, 1)
+    bb = sum(abs2, b)
+    _skip_bias(A, b, bb) && return nothing
+    nb = inv(sqrt(bb))
+    mul!(bR, transpose(A), b)
+    bR .*= nb
+    j = argmax(v -> dot(view(Vt, :, v), bR), axes(Vt, 2))
+    v = view(Vt, :, j)
+    mul!(u, A, v)
+    c = dot(u, b) * nb
+    k = inv(1 + c)
+    @inbounds for col in 1:d
+        vc = v[col]
+        rc = bR[col]
+        @simd ivdep for i in 1:d
+            bi = b[i] * nb
+            A[i, col] += ((1 + 2c) * bi - u[i]) * k * vc - (u[i] + bi) * k * rc
+        end
+    end
+    return nothing
+end
+
+"""
+    _simplex_dirs!(dirs, R) -> dirs
+
+`dirs[:, :, p] = R[:, :, p] * simplex_vertices(d)` in O(d^2) per particle:
+vertex `v <= d` is `a*R[:, v] - b*sum(R; dims=2)` and the last is
+`c*sum(R; dims=2)`, with the template constants.
+"""
+function _simplex_dirs!(dirs::Array{T, 3}, R::Array{T, 3}) where {T}
+    d = size(R, 1)
+    a = T(sqrt(1 + 1 / d))
+    b = T((sqrt(d + 1) + 1) / sqrt(d^3))
+    c = T(1 / sqrt(d))
+    @inbounds for p in axes(R, 3)
+        @simd for i in 1:d
+            dirs[i, d + 1, p] = zero(T)
+        end
+        for j in 1:d
+            @simd for i in 1:d
+                dirs[i, d + 1, p] += R[i, j, p]
+            end
+        end
+        for v in 1:d
+            @simd for i in 1:d
+                dirs[i, v, p] = a * R[i, v, p] - b * dirs[i, d + 1, p]
+            end
+        end
+        @simd for i in 1:d
+            dirs[i, d + 1, p] *= c
+        end
+    end
+    return dirs
 end

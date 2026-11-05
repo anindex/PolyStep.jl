@@ -215,6 +215,27 @@ end
         @test maximum(abs, R[:, 2, :] * R[:, 2, :]' ./ P .- (I - b0 * b0') ./ (d - 1)) < 0.02
     end
 
+    @testset "biased rotation lands a $poly vertex on the bias d=$d" for (poly, d) in
+        ((:simplex, 2), (:simplex, 3), (:simplex, 8), (:cube, 2), (:cube, 4))
+        P = 600
+        R = zeros(d, d, P)
+        haar_rotations!(R, R, Xoshiro(0))
+        bias = randn(Xoshiro(1), d, P)
+        bias ./= sqrt.(sum(abs2, bias; dims = 1))
+        Vt = polytope_vertices(poly, d)
+        biased_rotation!(R, bias, Vt)
+        reach = [vec(bias[:, p]' * R[:, :, p] * Vt) for p in 1:P]
+        @test maximum(r -> abs(maximum(r) - 1), reach) < 1e-12
+        @test all(p -> isrotation(R[:, :, p]; atol = 1e-12), 1:P)
+        hits = [count(r -> argmax(r) == j, reach) for j in axes(Vt, 2)]
+        poly === :simplex && d == 2 && @test minimum(hits) >= 150
+        R2 = zeros(12, 13, 2)
+        Rs = zeros(12, 12, 2)
+        haar_rotations!(Rs, Rs, Xoshiro(3))
+        @test isapprox(PolyStep._simplex_dirs!(R2, Rs),
+            stack(Rs[:, :, p] * simplex_vertices(12) for p in 1:2); atol = 1e-14)
+    end
+
     @testset "biased rotation d=1 is the identity" begin
         @test biased_rotation!(ones(1, 1, 3), [1.0 -1.0 1.0]) == ones(1, 1, 3)
     end

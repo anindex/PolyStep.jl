@@ -308,12 +308,93 @@ end
         @test LinearEpsilon(init = 1.0, target = 0.01, decay = 0.01) isa LinearEpsilon
     end
 
-    @testset "CosineEpsilon horizon (ceil) and SGDR period growth" begin
+    @testset "all-invalid step, tiny bias, repair, controller validation (core)" begin
+    sq(X) = vec(sum(abs2, X; dims = 1))
+    ps = PolyStepConfig(dim = 3, use_adaptive_radius = true)
+    st = init_state(ps, ones(3, 2))
+    step!(sq, ps, st; rng = Xoshiro(1))
+    r0, c0 = st.radius_multiplier, st.stagnation_count
+    @test step!(X -> fill(NaN, size(X, 2)), ps, st; rng = Xoshiro(2)) == Inf
+    @test st.costs[end] == Inf && st.radius_multiplier == r0 && st.stagnation_count == c0
+    pb = PolyStepConfig(dim = 4, biased_rotation = true)
+    sb = init_state(pb, ones(4, 1))
+    sb.prev_descent = fill(1e-9 / 2, 4, 1)
+    su = init_state(PolyStepConfig(dim = 4), ones(4, 1))
+    step!(sq, pb, sb; rng = Xoshiro(3))
+    step!(sq, PolyStepConfig(dim = 4), su; rng = Xoshiro(3))
+    @test sb.R == su.R
+    pr = PolyStepConfig(dim = 2, repair = X -> round.(X), max_iterations = 5)
+    sr = init_state(pr, [0.3 0.7]')
+    solve!(sq, pr, sr; rng = Xoshiro(4))
+    @test all(isinteger, sr.best_x)
+    for kw in ((velocity_lr = 0.0,), (momentum_init = 1.0,), (radius_min = 5.0, radius_max = 1.0),
+               (radius_increase = 0.5,), (radius_decrease = 1.5,), (stagnation_patience = 0,),
+               (newton_alpha = 0.0,), (solver = SinkhornSolver(), ent_epsilon = Inf),
+               (lb = (0, 0), ub = (1, 1)), (dim = 0,), (num_probe = 0,))
+        @test_throws ArgumentError init_state(PolyStepConfig(; dim = 2, kw...), zeros(2, 2))
+    end
+    @test_throws ArgumentError init_state(PolyStepConfig(dim = 2, solver = SinkhornSolver(),
+        epsilon = ProgressiveEpsilon(), ent_epsilon = ProgressiveEpsilon()), zeros(2, 2))
+    @test_logs (:warn, r"repair") match_mode = :any init_state(PolyStepConfig(dim = 2,
+        use_quadratic_model = true, num_probe = 2, repair = identity), zeros(2, 2))
+end
+
+@testset "biased simplex/cube steps, ProgressiveEpsilon on invalid steps, masked trust region" begin
+    sq(X) = vec(sum(abs2, X; dims = 1))
+    for poly in (:simplex, :cube)
+        ps = PolyStepConfig(dim = 3, polytope = poly, biased_rotation = true, epsilon = 0.3,
+            step_radius = 1.0)
+        st = init_state(ps, randn(Xoshiro(1), 3, 4))
+        step!(sq, ps, st; rng = Xoshiro(2))
+        step!(sq, ps, st; rng = Xoshiro(3))
+        @test all(p -> isapprox(maximum(st.bias[:, p]' * st.R[:, :, p] * st.Vt), 1; atol = 1e-8), 1:4)
+    end
+    ps = PolyStepConfig(dim = 3, epsilon = ProgressiveEpsilon(init = 1.0, target = 0.01),
+        solver = SinkhornSolver())
+    st = init_state(ps, randn(Xoshiro(1), 3, 4))
+    s0 = st.prog_eps.smoothed
+    step!(X -> fill(NaN, size(X, 2)), ps, st; rng = Xoshiro(2))
+    @test st.prog_eps.smoothed >= s0
+    ps2 = PolyStepConfig(dim = 3, num_probe = 2, use_quadratic_model = true, trust_region = true,
+        epsilon = 0.3, step_radius = 1.0, probe_radius = 1.0, lb = fill(-1.0, 3), ub = fill(1.0, 3))
+    st2 = init_state(ps2, hcat(fill(0.95, 3), zeros(3), fill(-0.95, 3), fill(0.1, 3)))
+    step!(sq, ps2, st2; rng = Xoshiro(2))
+    @test any(st2.clampflag) && all(isnan, st2.prev_predicted[st2.clampflag])
+    seen = Float64[]
+    pr = PolyStepConfig(dim = 1, num_probe = 2, use_quadratic_model = true, trust_region = true,
+        lb = 0.0, ub = 4.0, repair = X -> round.(X), max_iterations = 3)
+    obj(X) = (append!(seen, X); vec((X .- 2) .^ 2))
+    @test_logs (:warn, r"repair") match_mode = :any solve!(obj, pr, init_state(pr, fill(7.3, 1, 1));
+        rng = Xoshiro(4))
+    @test all(x -> isinteger(x) && 0 <= x <= 4, seen)
+    g(X) = vec(exp.(X) .- X .- 1)
+    pg = PolyStepConfig(dim = 1, epsilon = 1.0, num_probe = 2, use_quadratic_model = true,
+        trust_region = true, max_iterations = 1, min_iterations = 1)
+    sg = init_state(pg, zeros(1, 1))
+    solve!(g, pg, sg; rng = Xoshiro(1))
+    @test sg.best_f == 0.0
+end
+
+@testset "schedules reject non-finite and inconsistent parameters" begin
+    @test_throws ArgumentError CosineEpsilon(init = Inf, total_steps = 10)
+    @test_throws ArgumentError LinearEpsilon(target = Inf)
+    @test_throws ArgumentError ProgressiveEpsilon(init = 50.0, max_epsilon = 5.0)
+    @test_throws ArgumentError ProgressiveEpsilon(increase_factor = 0.5)
+    @test_throws ArgumentError ProgressiveEpsilon(decrease_factor = 2.0)
+    @test_throws ArgumentError ProgressiveEpsilon(fast_threshold = 0.6, slow_threshold = 0.5)
+end
+
+@testset "CosineEpsilon horizon (ceil) and SGDR period growth" begin
         @test epsilon_at(CosineEpsilon(), 99) > 1e-3
         @test epsilon_at(CosineEpsilon(), 100) == 1e-3
         s = CosineEpsilon(total_steps = 4, restart_mult = 1.2)
-        @test epsilon_at(s, 4) == 1.0 && epsilon_at(s, 9) == 1.0
-        @test epsilon_at(s, 1000) > 0.1
+        @test all(t -> epsilon_at(s, t) == 1.0, (-30, -3, -1, 0, 4))
+        @test isapprox([epsilon_at(s, t) for t in (8, 9, 13, 1000)],
+            [0.06792031081, 0.997031140942, 0.171156765358, 0.433443975355]; atol = 1e-10)
+        s = CosineEpsilon(target = 1e-3, init = 1.0, total_steps = 10, restart_mult = 1.5)
+        @test isapprox([epsilon_at(s, t) for t in (47, 80, 81, 120, 130)],
+            [0.0022167568952, 0.0043774403079, 0.0011352440309, 0.1305982654521,
+                0.0043774403079]; atol = 1e-12)
         # zero decay: the inferred horizon must not overflow Int
         @test isapprox(epsilon_at(CosineEpsilon(init = 1e7, target = 1.0, decay = 0.0), 5), 1e7)
     end
