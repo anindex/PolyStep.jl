@@ -1,5 +1,45 @@
 # Changelog
 
+## v0.3.0 (2026-11-05)
+
+This release ports the fixes of the Python package up to v1.1.1. Default `minimize` and
+`PolyStepES` runs give the same numbers as v0.2.0. Seeded runs change with Sinkhorn or
+KL-softmax, the simplex or cube, the trust region, Newton refinement with momentum, or a
+capped `HybridSubspace`.
+
+### Added
+
+- `radius_decay` for `PolyStepES`, `minimize` and `PolyStepOptimizer`.
+
+### Changed
+
+- The default `threshold` of `SinkhornSolver` and `KLSoftmaxSolver` is `3e-5` (was
+  `1e-6`). Sinkhorn stops on the relative marginal error, and KL-softmax on the dual step
+  divided by epsilon. Both stop early, unconverged, when the error stalls at machine
+  precision.
+- The trust region evaluates `f(X)` once per particle and applies its new radius in the
+  same step. Newton refinement runs before momentum and keeps the transport duals.
+- `biased_rotation` points the nearest simplex or cube vertex along the descent direction.
+- `max_subspace_dim` also shrinks full-width weight matrices.
+- `step!` and `solve!` extend CommonSolve, so they no longer clash with Optimization.jl.
+- `PolyStepES` takes its float type from `x0`, keeps the transport duals between rounds,
+  and weights costs in the wider of its type and the fitness type.
+- `repair` may return the repaired matrix in `PolyStepES` and `PolyStepConfig`.
+- `TemperedSoftmaxSolver` is removed. Use `SoftmaxSolver` with a fixed temperature.
+- Invalid settings of the controllers and schedules raise an error at construction.
+
+### Fixed
+
+- Zero and tiny marginals, non-finite costs in `:mean`/`:max` scaling and in the greedy
+  solvers, Float32 overflow in cost scaling, finite differences at very small radii, and
+  steps without a finite cost feeding the adaptive radius.
+- `CosineEpsilon` restarts now use the same periods as the Python package.
+
+### Performance
+
+- Simplex steps are approximately 1.5x faster at `d = 100`, and the Sinkhorn and KL
+  row updates approximately 2x faster.
+
 ## v0.2.0 (2026-09-26)
 
 Seeded runs give different numbers than v0.1.0 for `d > 8` (new rotation sampler, same

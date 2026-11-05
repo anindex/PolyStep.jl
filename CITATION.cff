@@ -2,8 +2,8 @@ cff-version: 1.2.0
 message: "If you use this software, please cite it as below."
 title: "PolyStep.jl: gradient-free polytope direct search for piecewise-constant objectives"
 type: software
-version: "0.2.0"
-date-released: "2026-09-26"
+version: "0.3.0"
+date-released: "2026-11-05"
 authors:
   - family-names: "Le"
     given-names: "An T."
@@ -29,7 +29,7 @@ preferred-citation:
   year: 2026
   url: "https://arxiv.org/abs/2605.01928"
 references:
-  - type: article
+  - type: conference-paper
     title: "Accelerating Motion Planning via Optimal Transport"
     authors:
       - family-names: "Le"
@@ -39,7 +39,7 @@ references:
       - family-names: "Biess"
         given-names: "Armin"
       - family-names: "Peters"
-        given-names: "Jan"
+        given-names: "Jan R."
     year: 2023
     conference:
       name: "Advances in Neural Information Processing Systems (NeurIPS)"
